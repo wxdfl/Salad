@@ -1,0 +1,47 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.wxdfl.salad'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'com.wxdfl.salad'
+        minSdk 26
+        targetSdk 35
+        versionCode 1
+        versionName '1.0'
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt')
+            // Signed with the debug key so the small release build can be
+            // installed directly. Use your own keystore before publishing.
+            signingConfig signingConfigs.debug
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    testOptions {
+        unitTests {
+            includeAndroidResources = true
+        }
+    }
+}
+
+dependencies {
+    // The app itself has no library dependencies. These are for tests only.
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation('org.robolectric:robolectric:4.16.1') {
+        // A 150 MB native graphics runtime the tests do not need (see robolectric.properties).
+        exclude module: 'nativeruntime-dist-compat'
+    }
+}

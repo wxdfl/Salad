@@ -1,0 +1,3 @@
+<resources>
+    <style name="BaseTheme" parent="android:Theme.Material" />
+</resources>
