@@ -1,0 +1,6 @@
+<resources>
+    <!-- Keep the classic layout (content between the system bars) on Android 15+. -->
+    <style name="AppTheme" parent="ColorTheme">
+        <item name="android:windowOptOutEdgeToEdgeEnforcement">true</item>
+    </style>
+</resources>
