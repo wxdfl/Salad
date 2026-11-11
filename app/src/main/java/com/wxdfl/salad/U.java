@@ -211,7 +211,7 @@ final class U {
             cost += buy * n.unitCost;
             table.addView(needRow(c, n.name, num(n.need) + " " + n.unit, num(n.stock),
                     buy <= 0 ? "✓" : num(buy) + " " + n.unit
-                            + (n.buyUnit == null ? "" : "\n= " + num(buy / n.buyFactor) + " " + n.buyUnit), false,
+                            + buyIn(n), false,
                     c.getColor(buy > 0 ? R.color.bad : R.color.good)));
         }
         box.addView(table);
@@ -221,6 +221,11 @@ final class U {
         total.setPadding(0, dp(c, 8), 0, 0);
         box.addView(total);
         return box;
+    }
+
+    /** For an ingredient with a bigger unit: the amount to buy in that unit, e.g. "\n= 2.2 can". */
+    static String buyIn(Db.Need n) {
+        return n.buyUnit == null ? "" : "\n= " + num(n.toBuy() / n.buyUnit.factor) + " " + n.buyUnit.name;
     }
 
     private static TableRow needRow(Context c, String a, String b, String d, String e, boolean head, int lastColor) {

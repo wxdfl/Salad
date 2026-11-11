@@ -151,8 +151,12 @@ final class Dialogs {
         return spinner;
     }
 
-    /** Bought more of an ingredient: adds stock and logs the expense. */
-    static void purchase(Context c, Db.Ingredient ing, Runnable done) {
+    /**
+     * Bought more of an ingredient: adds stock and logs the expense.
+     *
+     * @param suggested amount (in the base unit) to fill in to start with, or 0 for none
+     */
+    static void purchase(Context c, Db.Ingredient ing, double suggested, Runnable done) {
         LinearLayout form = U.column(c);
         EditText qty = U.input(c, true);
         EditText paid = U.input(c, true);
@@ -168,6 +172,17 @@ final class Dialogs {
         U.field(form, "Total paid (" + U.currency(c) + ")", paid);
         form.addView(U.muted(c, "\nThis adds to your stock, updates the ingredient's price and"
                 + " records the amount under Expenses."));
+        if (suggested > 0) {
+            // Suggest whole cans/packs when the ingredient has a bigger unit, otherwise the exact amount.
+            int big = -1;
+            for (int i = ing.units.size() - 1; i >= 0; i--) if (ing.units.get(i).factor > 1) big = i;
+            if (big < 0) {
+                qty.setText(U.plain(suggested));
+            } else {
+                qty.setText(U.plain(Math.ceil(suggested / ing.units.get(big).factor - 1e-9)));
+                unit.setSelection(big + 1);
+            }
+        }
         U.form(c, "Bought " + ing.name, form, () -> {
             double q = U.parse(qty.getText());
             double p = U.parse(paid.getText());

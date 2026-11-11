@@ -15,6 +15,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.widget.BaseAdapter;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
@@ -34,15 +35,16 @@ import java.util.List;
 
 /** The main screen: five tabs along the bottom. */
 public class MainActivity extends Activity {
-    private static final String[] TABS = {"Home", "Orders", "Recipes", "Stock", "Expenses"};
-    private static final String[] ICONS = {"🏠", "🧾", "🥗", "🧺", "💵"};
-    private static final String[] TITLES = {"Salad", "Orders", "Recipes", "Ingredients & stock", "Expenses"};
+    private static final String[] TABS = {"Home", "Orders", "Shopping", "Recipes", "Stock"};
+    private static final String[] ICONS = {"🏠", "🧾", "🛒", "🥗", "🧺"};
+    private static final String[] TITLES = {"Salad", "Orders", "Shopping list", "Recipes", "Ingredients & stock"};
     private static final int REQ_BACKUP = 1, REQ_RESTORE = 2;
 
     private final TextView[] tabViews = new TextView[TABS.length];
     private FrameLayout content;
     private int tab;
     private String month = U.today().substring(0, 7);
+    private boolean history;   // Orders tab: showing completed orders instead of open ones
 
     @Override
     protected void onCreate(Bundle saved) {
@@ -50,6 +52,7 @@ public class MainActivity extends Activity {
         if (saved != null) {
             tab = saved.getInt("tab");
             month = saved.getString("month", month);
+            history = saved.getBoolean("history");
         }
         LinearLayout root = U.column(this);
         content = new FrameLayout(this);
@@ -78,6 +81,7 @@ public class MainActivity extends Activity {
         super.onSaveInstanceState(out);
         out.putInt("tab", tab);
         out.putString("month", month);
+        out.putBoolean("history", history);
     }
 
     @Override
@@ -106,9 +110,9 @@ public class MainActivity extends Activity {
         switch (index) {
             case 0: content.addView(home()); break;
             case 1: content.addView(orders()); break;
-            case 2: content.addView(recipes()); break;
-            case 3: content.addView(stock()); break;
-            default: content.addView(expenses()); break;
+            case 2: content.addView(shopping()); break;
+            case 3: content.addView(recipes()); break;
+            default: content.addView(stock()); break;
         }
     }
 
@@ -134,19 +138,38 @@ public class MainActivity extends Activity {
                 U.card(this, "Ingredient cost", U.money(this, s.ingredientCost), margin, 0)));
 
         int pending = db().pendingOrderCount();
-        col.addView(U.sectionTitle(this, "To prepare for " + pending
-                + (pending == 1 ? " open order" : " open orders")));
-        List<Db.Need> needs = db().pendingNeeds();
-        if (needs.isEmpty()) {
-            col.addView(U.muted(this, pending == 0
-                    ? "No open orders. Add one in the Orders tab and the ingredients you need will show up here."
-                    : "The recipes in your open orders have no ingredients yet. Add them in the Recipes tab."));
-        } else {
-            col.addView(U.needsTable(this, needs));
+        TextView open = U.muted(this, pending == 0 ? "No open orders."
+                : pending + (pending == 1 ? " open order" : " open orders") + " · see the Shopping tab for what to buy.");
+        open.setPadding(0, U.dp(this, 12), 0, 0);
+        col.addView(open);
+
+        col.addView(U.sectionTitle(this, "Expenses in " + U.monthLabel(month)));
+        List<Db.Expense> spent = db().expenses(month);
+        if (spent.isEmpty()) col.addView(U.muted(this, "Nothing spent this month yet."));
+        for (Db.Expense e : spent) {
+            String sub = U.niceDate(e.date) + (e.note.isEmpty() ? "" : " · " + e.note);
+            View row = rowView(new Item(e.category, sub, U.money(this, e.amount), () -> { }));
+            row.setPadding(0, row.getPaddingTop(), 0, row.getPaddingBottom());
+            row.setBackgroundResource(ripple());
+            row.setOnClickListener(v -> Dialogs.expense(this, e, this::refresh));
+            col.addView(row);
         }
+        Button add = new Button(this);
+        add.setText("＋ New expense");
+        add.setOnClickListener(v -> Dialogs.expense(this, null, this::refresh));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = U.dp(this, 8);
+        col.addView(add, lp);
         ScrollView scroll = new ScrollView(this);
         scroll.addView(col);
         return scroll;
+    }
+
+    private int ripple() {
+        TypedValue value = new TypedValue();
+        getTheme().resolveAttribute(android.R.attr.selectableItemBackground, value, true);
+        return value.resourceId;
     }
 
     private View cardRow(View left, View right) {
@@ -202,7 +225,7 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** A list of rows with an "add" button underneath. */
+    /** A list of rows with an "add" button underneath (no button when {@code addLabel} is null). */
     private View listScreen(View top, List<Item> items, String empty, String addLabel, Runnable onAdd) {
         LinearLayout col = U.column(this);
         if (top != null) col.addView(top);
@@ -249,6 +272,7 @@ public class MainActivity extends Activity {
             list.setOnItemClickListener((parent, view, position, id) -> items.get(position).onTap.run());
             col.addView(list, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
         }
+        if (addLabel == null) return col;
         Button add = new Button(this);
         add.setText(addLabel);
         add.setOnClickListener(v -> onAdd.run());
@@ -282,22 +306,59 @@ public class MainActivity extends Activity {
     // ---------------------------------------------------------------- orders
 
     private View orders() {
+        List<Db.Order> all = db().orders();
+        LinearLayout top = U.column(this);
+        LinearLayout toggle = U.row(this);
+        toggle.addView(toggleButton("To make", !history, false), U.weight());
+        toggle.addView(toggleButton("History", history, true), U.weight());
+        top.addView(toggle);
+
         List<Item> items = new ArrayList<>();
-        boolean doneHeader = false;
-        for (Db.Order o : db().orders()) {
-            if (items.isEmpty() && !o.done) items.add(new Item("To make", "", "", null));
-            if (o.done && !doneHeader) {
-                items.add(new Item("Completed (sold)", "", "", null));
-                doneHeader = true;
+        if (!history) {
+            for (Db.Order o : all) {
+                if (o.done) continue;
+                String sub = "Due " + U.niceDate(o.due) + (o.summary.isEmpty() ? "" : " · " + o.summary);
+                items.add(new Item(orderTitle(o), sub, U.money(this, o.total), () -> openOrder(o.id)));
             }
-            String title = o.customer == null || o.customer.isEmpty() ? "Order #" + o.id : o.customer;
-            String when = o.done ? "Sold " + U.niceDate(o.doneDate) : "Due " + U.niceDate(o.due);
-            String sub = when + (o.summary.isEmpty() ? "" : " · " + o.summary);
-            items.add(new Item(title, sub, U.money(this, o.total), () -> openOrder(o.id)));
+            return listScreen(top, items,
+                    "No open orders.\n\nAdd an order to see which ingredients to buy and prepare.",
+                    "＋ New order", () -> openOrder(0));
         }
-        return listScreen(null, items,
-                "No orders yet.\n\nAdd an order to see which ingredients to buy and prepare.",
-                "＋ New order", () -> openOrder(0));
+
+        // History: everything sold in the chosen month, newest first.
+        double total = 0;
+        for (Db.Order o : all) {
+            if (!o.done || o.doneDate == null || !o.doneDate.startsWith(month)) continue;
+            total += o.total;
+            String sub = "Sold " + U.niceDate(o.doneDate) + (o.summary.isEmpty() ? "" : " · " + o.summary);
+            items.add(new Item(orderTitle(o), sub, U.money(this, o.total), () -> openOrder(o.id)));
+        }
+        LinearLayout bar = U.column(this);
+        int p = U.dp(this, 16);
+        bar.setPadding(p, 0, p, 0);
+        bar.addView(monthBar());
+        TextView sum = U.muted(this, items.size() + (items.size() == 1 ? " order" : " orders")
+                + " completed · " + U.money(this, total) + " in sales");
+        sum.setGravity(Gravity.CENTER);
+        bar.addView(sum);
+        top.addView(bar);
+        return listScreen(top, items, "No completed orders in " + U.monthLabel(month) + ".", null, null);
+    }
+
+    private static String orderTitle(Db.Order o) {
+        return o.customer == null || o.customer.isEmpty() ? "Order #" + o.id : o.customer;
+    }
+
+    private Button toggleButton(String label, boolean selected, boolean showsHistory) {
+        Button b = new Button(this, null, android.R.attr.borderlessButtonStyle);
+        b.setText(label);
+        b.setTextColor(getColor(selected ? R.color.accent : R.color.muted));
+        b.setTypeface(null, selected ? android.graphics.Typeface.BOLD : android.graphics.Typeface.NORMAL);
+        b.setOnClickListener(v -> {
+            history = showsHistory;
+            refresh();
+        });
+        return b;
     }
 
     private void openOrder(long id) {
@@ -347,7 +408,7 @@ public class MainActivity extends Activity {
     private void ingredientMenu(Db.Ingredient i) {
         String[] actions = {"I bought more (adds stock + expense)", "Edit", "Delete"};
         new AlertDialog.Builder(this).setTitle(i.name).setItems(actions, (d, which) -> {
-            if (which == 0) Dialogs.purchase(this, i, this::refresh);
+            if (which == 0) Dialogs.purchase(this, i, 0, this::refresh);
             else if (which == 1) Dialogs.ingredient(this, i, this::refresh);
             else U.confirm(this, "Delete " + i.name + "? It will also be removed from your recipes.",
                         "Delete", () -> {
@@ -357,26 +418,101 @@ public class MainActivity extends Activity {
         }).show();
     }
 
-    // -------------------------------------------------------------- expenses
+    // -------------------------------------------------------------- shopping
 
-    private View expenses() {
-        List<Item> items = new ArrayList<>();
-        double total = 0;
-        for (Db.Expense e : db().expenses(month)) {
-            total += e.amount;
-            String sub = U.niceDate(e.date) + (e.note.isEmpty() ? "" : " · " + e.note);
-            items.add(new Item(e.category, sub, U.money(this, e.amount),
-                    () -> Dialogs.expense(this, e, this::refresh)));
+    /** A checklist of what to buy so that every open order can be made. */
+    private View shopping() {
+        List<Db.Need> needs = db().pendingNeeds();
+        List<Db.Need> buy = new ArrayList<>();
+        List<Long> buyIds = new ArrayList<>();
+        double cost = 0;
+        for (Db.Need n : needs) {
+            if (n.toBuy() <= 0) continue;
+            buy.add(n);
+            buyIds.add(n.ingredient.id);
+            cost += n.toBuy() * n.unitCost;
         }
-        LinearLayout top = U.column(this);
+        db().untickAllExcept(buyIds);
+        int pending = db().pendingOrderCount();
+
+        LinearLayout col = U.column(this);
         int p = U.dp(this, 16);
-        top.setPadding(p, U.dp(this, 8), p, 0);
-        top.addView(monthBar());
-        TextView sum = U.muted(this, "Total spent: " + U.money(this, total));
-        sum.setGravity(Gravity.CENTER);
-        top.addView(sum);
-        return listScreen(top, items, "No expenses in " + U.monthLabel(month) + ".",
-                "＋ New expense", () -> Dialogs.expense(this, null, this::refresh));
+        col.setPadding(p, U.dp(this, 12), p, p);
+        if (needs.isEmpty()) {
+            TextView t = U.muted(this, pending == 0
+                    ? "Nothing to buy.\n\nAdd an order in the Orders tab and what you need to buy shows up here."
+                    : "The recipes in your open orders have no ingredients yet. Add them in the Recipes tab.");
+            t.setTextSize(15);
+            t.setGravity(Gravity.CENTER);
+            t.setPadding(p, U.dp(this, 48), p, p);
+            col.addView(t);
+        } else if (buy.isEmpty()) {
+            TextView t = U.text(this, "✓ You have everything for your "
+                    + (pending == 1 ? "open order." : pending + " open orders."), 16, true);
+            t.setTextColor(getColor(R.color.good));
+            col.addView(t);
+        } else {
+            col.addView(U.text(this, "To make your " + (pending == 1 ? "open order" : pending + " open orders")
+                    + " · about " + U.money(this, cost), 16, true));
+            TextView hint = U.muted(this, "Tick things off as you shop. When you've bought something,"
+                    + " tap its name to add it to your stock and expenses.");
+            hint.setPadding(0, U.dp(this, 4), 0, U.dp(this, 8));
+            col.addView(hint);
+            for (Db.Need n : buy) col.addView(shoppingRow(n));
+        }
+        boolean header = false;
+        for (Db.Need n : needs) {
+            if (n.toBuy() > 0) continue;
+            if (!header) col.addView(U.sectionTitle(this, "Already enough in stock"));
+            header = true;
+            View row = rowView(new Item(n.name, needText(n), "✓", () -> { }));
+            row.setPadding(0, row.getPaddingTop(), 0, row.getPaddingBottom());
+            col.addView(row);
+        }
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(col);
+        return scroll;
+    }
+
+    private static String needText(Db.Need n) {
+        return "Need " + U.num(n.need) + " " + n.unit + " · have " + U.num(n.stock) + " " + n.unit;
+    }
+
+    private View shoppingRow(Db.Need n) {
+        LinearLayout row = U.row(this);
+        CheckBox box = new CheckBox(this);
+        box.setChecked(n.ingredient.ticked);
+        box.setContentDescription("Got " + n.name);
+        row.addView(box);
+
+        LinearLayout body = U.row(this);
+        body.setPadding(U.dp(this, 4), U.dp(this, 10), 0, U.dp(this, 10));
+        body.setBackgroundResource(ripple());
+        LinearLayout left = U.column(this);
+        TextView name = U.text(this, n.name, 16, false);
+        left.addView(name);
+        left.addView(U.muted(this, needText(n)));
+        body.addView(left, U.weight());
+        TextView amount = U.text(this, U.num(n.toBuy()) + " " + n.unit + U.buyIn(n), 16, true);
+        amount.setGravity(Gravity.END);
+        amount.setPadding(U.dp(this, 12), 0, 0, 0);
+        body.addView(amount);
+        body.setOnClickListener(v -> Dialogs.purchase(this, n.ingredient, n.toBuy(), this::refresh));
+        row.addView(body, U.weight());
+
+        Runnable style = () -> {
+            boolean got = box.isChecked();
+            int strike = android.graphics.Paint.STRIKE_THRU_TEXT_FLAG;
+            name.setPaintFlags(got ? name.getPaintFlags() | strike : name.getPaintFlags() & ~strike);
+            name.setAlpha(got ? 0.5f : 1f);
+            amount.setAlpha(got ? 0.5f : 1f);
+        };
+        style.run();
+        box.setOnCheckedChangeListener((button, checked) -> {
+            db().setTicked(n.ingredient.id, checked);
+            style.run();
+        });
+        return row;
     }
 
     // ------------------------------------------------------------------ menu

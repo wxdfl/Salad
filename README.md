@@ -2,18 +2,20 @@
 
 A small, offline Android app for running a home-based food business.
 
-- **Orders** – add what a customer ordered and the app tells you how much of each
-  ingredient you need, how much you already have, and how much to buy.
-  Marking an order as completed records the sale and takes the ingredients out of stock.
+- **Home** – sales, expenses and profit for the month, and the list of that month's expenses
+  (packaging, gas, delivery…) with a button to add more.
+- **Orders** – add what a customer ordered. Each line can be customised for that order only
+  (extra lettuce, no tomato, an added ingredient, a different price). Marking an order as
+  completed records the sale and takes the ingredients out of stock.
+  **History** shows the completed orders and sales of any month.
+- **Shopping** – a checklist of what to buy so every open order can be made: how much is
+  needed, how much you have and how much is missing. Tick things off as you shop; tap an item
+  to record the purchase, which adds it to stock and logs the expense.
 - **Recipes** – what you sell, its price, and the ingredients in one serving.
   Shows the cost and profit per serving.
 - **Stock** – your raw materials, their price and how much you have.
-  "I bought more" adds stock and logs the expense in one step.
   An ingredient can have extra units of any size you choose (1 can = 250 g, 1 scoop = 20 g…);
   use them in recipes and when buying, and the shopping list shows how many cans to get.
-- **Expenses** – everything else you spend (packaging, gas, delivery…).
-- **Home** – sales, expenses and profit for the month, plus one combined
-  shopping/prep list for all open orders.
 
 Data is stored only on the phone. Use **⋮ → Back up data** to save a copy somewhere safe
 (and **Restore from backup** to bring it back, e.g. on a new phone).

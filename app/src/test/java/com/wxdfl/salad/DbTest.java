@@ -155,6 +155,106 @@ public class DbTest {
         assertEquals(3, db.summary("2026-11").expenses, 1e-9);
     }
 
+    private static Db.Mod mod(Db.Ingredient i, double delta, boolean none) {
+        Db.Mod m = new Db.Mod();
+        m.ingredientId = i.id;
+        m.name = i.name;
+        m.unit = i.unit;
+        m.delta = delta;
+        m.none = none;
+        return m;
+    }
+
+    /** Two salads with extra lettuce (+50 g each) and no tomato. */
+    private Db.Order customOrder() {
+        Db.Order o = new Db.Order();
+        o.due = "2026-11-12";
+        Db.OrderItem it = new Db.OrderItem();
+        it.recipeId = salad.id;
+        it.name = salad.name;
+        it.qty = 2;
+        it.price = 9;
+        it.mods.add(mod(stock("Lettuce"), 50, false));
+        it.mods.add(mod(stock("Tomatoes"), 0, true));
+        db.saveOrder(o, Collections.singletonList(it));
+        return o;
+    }
+
+    @Test
+    public void customOrderChangesWhatIsNeeded() {
+        Db.Order o = customOrder();
+        List<Db.Need> needs = db.pendingNeeds();
+        assertEquals(3, needs.size());                               // no tomatoes at all
+        assertEquals(300, need(needs, "Lettuce").need, 1e-9);        // (100 + 50) x 2
+        assertEquals(300, need(needs, "Chicken").need, 1e-9);        // unchanged
+
+        Db.OrderItem saved = db.orderItems(o.id).get(0);
+        assertEquals("+50 g Lettuce, no Tomatoes", saved.custom);
+        assertEquals(2, saved.mods.size());
+        assertEquals(2.30, saved.cost, 1e-9);                        // 2.55 + 0.25 lettuce - 0.50 tomato
+        assertEquals("2× Chicken Salad (+50 g Lettuce, no Tomatoes)", db.order(o.id).summary);
+        assertEquals(18, db.order(o.id).total, 1e-9);
+
+        order(db, salad, 1, "2026-11-13");                           // a normal one alongside
+        needs = db.pendingNeeds();
+        assertEquals(400, need(needs, "Lettuce").need, 1e-9);
+        assertEquals(1, need(needs, "Tomatoes").need, 1e-9);
+    }
+
+    @Test
+    public void completingACustomOrderUsesTheChangedAmounts() {
+        Db.Order o = customOrder();
+        db.completeOrder(o.id, "2026-11-12");
+        assertEquals(0, stock("Lettuce").stock, 1e-9);               // had 150, used 300
+        assertEquals(700, stock("Chicken").stock, 1e-9);
+        assertEquals(1, stock("Tomatoes").stock, 1e-9);              // untouched
+        assertEquals(4.60, db.summary("2026-11").ingredientCost, 1e-9);
+        assertEquals(18, db.summary("2026-11").sales, 1e-9);
+        assertEquals("+50 g Lettuce, no Tomatoes", db.orderItems(o.id).get(0).custom);
+    }
+
+    @Test
+    public void customOrderCanAddAnIngredientOrUseLess() {
+        Db.Ingredient avocado = ingredient(db, "Avocado", "g", 200, 4, 0);
+        List<Db.Mod> mods = new ArrayList<>();
+        mods.add(mod(avocado, 30, false));
+        mods.add(mod(stock("Chicken"), -50, false));
+        mods.add(mod(stock("Corn"), -80, false));                    // more than the recipe has: none left
+        java.util.Map<Long, Double> amounts = db.servingAmounts(salad.id, mods);
+        assertEquals(30, amounts.get(avocado.id), 1e-9);
+        assertEquals(100, amounts.get(stock("Chicken").id), 1e-9);
+        assertTrue(!amounts.containsKey(stock("Corn").id));
+        assertEquals("+30 g Avocado, −50 g Chicken, −80 g Corn", Db.describe(mods));
+        assertEquals(2.55 + 0.60 - 0.45 - 0.20, db.servingCost(salad.id, mods), 1e-9);
+
+        // Deleting the ingredient drops the change with it.
+        Db.Order o = new Db.Order();
+        o.due = "2026-11-12";
+        Db.OrderItem it = new Db.OrderItem();
+        it.recipeId = salad.id;
+        it.name = salad.name;
+        it.qty = 1;
+        it.mods = mods;
+        db.saveOrder(o, Collections.singletonList(it));
+        db.deleteIngredient(avocado.id);
+        assertEquals(2, db.orderItems(o.id).get(0).mods.size());
+    }
+
+    @Test
+    public void shoppingTicksAreRememberedAndCleared() {
+        long lettuce = stock("Lettuce").id;
+        long corn = stock("Corn").id;
+        db.setTicked(lettuce, true);
+        db.setTicked(corn, true);
+        assertTrue(stock("Lettuce").ticked);
+        db.recordPurchase(stock("Corn"), 100, null, 1, "2026-11-10");   // bought: tick goes away
+        assertTrue(!stock("Corn").ticked);
+        db.untickAllExcept(Collections.singletonList(lettuce));
+        assertTrue(stock("Lettuce").ticked);
+        db.untickAllExcept(new ArrayList<>());
+        assertTrue(!stock("Lettuce").ticked);
+    }
+
     /** Corn can also be counted in cans of 250 g; a "Corn cup" uses 1 can (costs 1.00). */
     private Db.Recipe cornCup() {
         Db.Ingredient corn = stock("Corn");
@@ -183,8 +283,8 @@ public class DbTest {
         order(db, salad, 1, "2026-11-12");                           // 50 g more, written in grams
         Db.Need corn = need(db.pendingNeeds(), "Corn");
         assertEquals(550, corn.need, 1e-9);
-        assertEquals("can", corn.buyUnit);
-        assertEquals(2.2, corn.toBuy() / corn.buyFactor, 1e-9);
+        assertEquals("can", corn.buyUnit.name);
+        assertEquals(2.2, corn.toBuy() / corn.buyUnit.factor, 1e-9);
         assertEquals(null, need(db.pendingNeeds(), "Lettuce").buyUnit);
     }
 
@@ -249,6 +349,11 @@ public class DbTest {
         assertEquals(200, need(db.pendingNeeds(), "Corn").need, 1e-9);
         assertEquals(170, need(db.pendingNeeds(), "Corn").toBuy(), 1e-9);
         assertTrue(stock("Corn").units.isEmpty());
+        assertTrue(!stock("Corn").ticked);
+        assertEquals("2× Corn cup", db.order(1).summary);
+        db.completeOrder(1, "2026-11-12");                           // old order lines can still be completed
+        assertEquals(0.4, db.orderItems(1).get(0).cost, 1e-9);
+        assertEquals(0, stock("Corn").stock, 1e-9);
         cornCup();                                                   // the new feature works on old data
         assertEquals("can", stock("Corn").units.get(0).name);
     }

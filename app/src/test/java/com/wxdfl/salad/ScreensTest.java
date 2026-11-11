@@ -82,29 +82,94 @@ public class ScreensTest {
     @Test
     public void everyTabShowsItsData() {
         MainActivity a = Robolectric.buildActivity(MainActivity.class).setup().get();
-        see(a, "To prepare for 1 open order");
-        see(a, "$24");                 // sales: 3 salads at 8
-        see(a, "Tomatoes");
-
-        a.show(1);
-        see(a, "To make");
-        see(a, "Completed (sold)");
-        see(a, "2× Chicken Salad");
-
-        a.show(2);
-        see(a, "Costs $2.55 · profit $5.45 (68%)");
-
-        a.show(3);
-        see(a, "$2.50 per 500 g");
-        see(a, "$1.60 per 400 g · 1 can = 250 g");
-
-        a.show(4);
-        see(a, "Total spent: $1.60");
-
+        see(a, "$24");                                   // sales: 3 salads at 8
+        see(a, "1 open order");
+        see(a, "Expenses in " + U.monthLabel(U.today().substring(0, 7)));
+        see(a, "Corn 400 g");                            // the purchase shows as an expense on Home
         see(a, "New expense").performClick();
         ShadowLooper.idleMainLooper();
-        assertNotNull(ShadowDialog.getLatestDialog());
         assertTrue(ShadowDialog.getLatestDialog().isShowing());
+        ShadowDialog.getLatestDialog().dismiss();
+
+        a.show(1);
+        see(a, "Due ");
+        see(a, "2× Chicken Salad");
+        assertEquals(null, find(a.getWindow().getDecorView(), "Sold "));
+        see(a, "History").performClick();
+        see(a, "3× Chicken Salad");
+        see(a, "1 order completed · $24 in sales");
+        assertEquals(null, find(a.getWindow().getDecorView(), "New order"));
+
+        a.show(3);
+        see(a, "Costs $2.55 · profit $5.45 (68%)");
+
+        a.show(4);
+        see(a, "$2.50 per 500 g");
+        see(a, "$1.60 per 400 g · 1 can = 250 g");
+    }
+
+    @Test
+    public void shoppingListIsAChecklistOfWhatToBuy() {
+        MainActivity a = Robolectric.buildActivity(MainActivity.class).setup().get();
+        a.show(2);
+        // 2 salads still to make; the 3 already sold used up the lettuce and the tomato.
+        see(a, "To make your open order · about $2");
+        see(a, "Need 200 g · have 0 g");
+        see(a, "2 pcs");
+        see(a, "Already enough in stock");
+        see(a, "Need 300 g · have 550 g");               // chicken
+
+        android.widget.CheckBox box = (android.widget.CheckBox) findType(a.getWindow().getDecorView(),
+                android.widget.CheckBox.class);
+        assertTrue(!box.isChecked());
+        box.performClick();
+        assertTrue(db.ingredients().get(2).ticked);      // Lettuce is the first thing to buy
+        a.show(2);                                       // the tick is still there after coming back
+        box = (android.widget.CheckBox) findType(a.getWindow().getDecorView(), android.widget.CheckBox.class);
+        assertTrue(box.isChecked());
+
+        // Tapping the item records the purchase, which takes it off the list.
+        ((View) see(a, "Lettuce").getParent().getParent()).performClick();   // the row body
+        ShadowLooper.idleMainLooper();
+        android.app.AlertDialog dialog = (android.app.AlertDialog) ShadowDialog.getLatestDialog();
+        java.util.List<android.widget.EditText> inputs = new java.util.ArrayList<>();
+        collect(dialog.getWindow().getDecorView(), inputs);
+        assertEquals("200", inputs.get(0).getText().toString());     // suggested amount
+        inputs.get(1).setText("1");
+        dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE).performClick();
+        ShadowLooper.idleMainLooper();
+        assertEquals(200, db.ingredients().get(2).stock, 1e-9);
+        assertTrue(!db.ingredients().get(2).ticked);
+        see(a, "To make your open order · about $1");    // only the tomatoes are left
+        see(a, "Need 200 g · have 200 g");
+    }
+
+    @Test
+    public void orderLineCanBeCustomised() {
+        OrderActivity a = Robolectric.buildActivity(OrderActivity.class,
+                new Intent().putExtra("id", open.id)).setup().get();
+        ((View) see(a, "tap to customise").getParent()).performClick();
+        ShadowLooper.idleMainLooper();
+        android.app.AlertDialog dialog = (android.app.AlertDialog) ShadowDialog.getLatestDialog();
+        java.util.List<android.widget.EditText> inputs = new java.util.ArrayList<>();
+        collect(dialog.getWindow().getDecorView(), inputs);
+        assertEquals(5, inputs.size());                  // price, then chicken, corn, lettuce, tomatoes
+        assertEquals("100", inputs.get(3).getText().toString());
+        inputs.get(0).setText("9");
+        inputs.get(3).setText("150");                    // extra lettuce
+        inputs.get(4).setText("0");                      // no tomato
+        dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE).performClick();
+        ShadowLooper.idleMainLooper();
+
+        see(a, "+50 g Lettuce, no Tomatoes");
+        see(a, "Total: $18");
+        see(a, "300 g");                                 // lettuce needed for the 2 servings
+        assertEquals(null, find(a.getWindow().getDecorView(), "Tomatoes\n"));
+        see(a, "Save order").performClick();
+        Db.OrderItem saved = db.orderItems(open.id).get(0);
+        assertEquals("+50 g Lettuce, no Tomatoes", saved.custom);
+        assertEquals(9, saved.price, 1e-9);
+        assertEquals(2.30, saved.cost, 1e-9);
     }
 
     @Test

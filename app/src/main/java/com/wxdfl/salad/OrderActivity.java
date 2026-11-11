@@ -3,6 +3,7 @@ package com.wxdfl.salad;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.os.Bundle;
+import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.MenuItem;
 import android.widget.Button;
@@ -14,8 +15,10 @@ import android.widget.Toast;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /** Add or edit an order, see what it needs, and mark it as completed (sold). */
 public class OrderActivity extends Activity {
@@ -136,17 +139,28 @@ public class OrderActivity extends Activity {
         itemsBox.removeAllViews();
         if (items.isEmpty()) itemsBox.addView(U.muted(this, "Nothing yet. Add what the customer ordered."));
         double total = 0, cost = 0;
-        Map<Long, Integer> servings = new LinkedHashMap<>();
+        TypedValue ripple = new TypedValue();
+        getTheme().resolveAttribute(android.R.attr.selectableItemBackground, ripple, true);
         for (Db.OrderItem it : items) {
             total += it.qty * it.price;
             cost += it.qty * it.cost;
-            servings.merge(it.recipeId, it.qty, Integer::sum);
 
             LinearLayout row = U.row(this);
             row.setPadding(0, U.dp(this, 4), 0, U.dp(this, 4));
             LinearLayout left = U.column(this);
             left.addView(U.text(this, it.name, 16, false));
-            left.addView(U.muted(this, U.money(this, it.price) + " each"));
+            if (!it.custom.isEmpty()) {
+                TextView custom = U.text(this, it.custom, 13, false);
+                custom.setTextColor(getColor(R.color.accent));
+                left.addView(custom);
+            }
+            left.addView(U.muted(this, U.money(this, it.price) + " each"
+                    + (open && it.custom.isEmpty() ? " · tap to customise" : "")));
+            if (open) {
+                left.setBackgroundResource(ripple.resourceId);
+                left.setContentDescription("Customise " + it.name);
+                left.setOnClickListener(v -> customise(it));
+            }
             row.addView(left, U.weight());
             if (open) row.addView(stepButton("−", "Less " + it.name, it, -1));
             TextView qty = U.text(this, (open ? "" : "× ") + it.qty, 17, true);
@@ -166,7 +180,7 @@ public class OrderActivity extends Activity {
         needsBox.removeAllViews();
         if (open && !items.isEmpty()) {
             needsBox.addView(U.sectionTitle(this, "Ingredients needed for this order"));
-            List<Db.Need> needs = db.needsFor(servings);
+            List<Db.Need> needs = db.needsFor(items);
             if (needs.isEmpty()) {
                 needsBox.addView(U.muted(this, "These recipes have no ingredients yet. Add them in the Recipes tab."));
             } else {
@@ -202,7 +216,7 @@ public class OrderActivity extends Activity {
         new AlertDialog.Builder(this).setTitle("Add item").setItems(labels, (d, which) -> {
             Db.Recipe r = recipes.get(which);
             for (Db.OrderItem it : items) {
-                if (it.recipeId == r.id) {
+                if (it.recipeId == r.id && it.mods.isEmpty()) {
                     it.qty++;
                     showItems();
                     return;
@@ -217,6 +231,103 @@ public class OrderActivity extends Activity {
             items.add(it);
             showItems();
         }).show();
+    }
+
+    /** Changes one order line for this order only: its price and how much of each ingredient. */
+    private void customise(Db.OrderItem it) {
+        Map<Long, Double> normal = db.recipeAmounts(it.recipeId);
+        Map<Long, Double> current = db.servingAmounts(it.recipeId, it.mods);
+        List<Db.Ingredient> all = db.ingredients();
+        Map<Long, EditText> fields = new LinkedHashMap<>();
+
+        LinearLayout form = U.column(this);
+        EditText price = U.input(this, true);
+        price.setText(U.plain(it.price));
+        U.field(form, "Price each (" + U.currency(this) + ")", price);
+        form.addView(U.sectionTitle(this, "Amount in each serving"));
+        form.addView(U.muted(this, "For this order only. Put 0 to leave something out, or a bigger number"
+                + " for extra. If only some servings are different, add the item again as its own line."));
+        LinearLayout rows = U.column(this);
+        form.addView(rows);
+        Set<Long> ids = new LinkedHashSet<>(normal.keySet());
+        ids.addAll(current.keySet());
+        for (Db.Ingredient i : all) {
+            if (ids.contains(i.id)) amountRow(rows, fields, i, normal.get(i.id), current.get(i.id));
+        }
+        Button add = new Button(this, null, android.R.attr.borderlessButtonStyle);
+        add.setText("＋ Add another ingredient");
+        add.setTextColor(getColor(R.color.accent));
+        add.setOnClickListener(v -> {
+            List<Db.Ingredient> choices = new ArrayList<>();
+            for (Db.Ingredient i : all) if (!fields.containsKey(i.id)) choices.add(i);
+            if (choices.isEmpty()) {
+                toast("Every ingredient is already listed");
+                return;
+            }
+            String[] labels = new String[choices.size()];
+            for (int i = 0; i < labels.length; i++) labels[i] = choices.get(i).name;
+            new AlertDialog.Builder(this).setTitle("Add ingredient").setItems(labels, (d, which) ->
+                    amountRow(rows, fields, choices.get(which), null, null).requestFocus()).show();
+        });
+        form.addView(add);
+
+        U.form(this, it.name, form, () -> {
+            double p = U.parse(price.getText());
+            if (!(p >= 0)) {
+                price.setError("Enter a price");
+                price.requestFocus();
+                return false;
+            }
+            List<Db.Mod> mods = new ArrayList<>();
+            for (Db.Ingredient i : all) {
+                EditText field = fields.get(i.id);
+                if (field == null) continue;
+                double usual = normal.getOrDefault(i.id, 0.0);
+                String typed = field.getText().toString().trim();
+                double amount = typed.isEmpty() ? usual : U.parse(typed);   // left blank = as usual
+                if (!(amount >= 0)) {
+                    field.setError("Enter an amount, or 0 for none");
+                    field.requestFocus();
+                    return false;
+                }
+                if (Math.abs(amount - usual) < 1e-9) continue;
+                Db.Mod m = new Db.Mod();
+                m.ingredientId = i.id;
+                m.name = i.name;
+                m.unit = i.unit;
+                m.none = amount == 0;
+                m.delta = m.none ? 0 : amount - usual;
+                mods.add(m);
+            }
+            it.price = p;
+            it.mods = mods;
+            it.custom = Db.describe(mods);
+            it.cost = db.servingCost(it.recipeId, mods);
+            showItems();
+            return true;
+        }, null);
+    }
+
+    /** One "ingredient  [amount] unit" row of the customise form; returns the amount field. */
+    private EditText amountRow(LinearLayout rows, Map<Long, EditText> fields, Db.Ingredient i,
+                               Double usual, Double current) {
+        LinearLayout row = U.row(this);
+        LinearLayout left = U.column(this);
+        left.addView(U.text(this, i.name, 16, false));
+        left.addView(U.muted(this, usual == null ? "not in the recipe" : "usually " + U.num(usual) + " " + i.unit));
+        row.addView(left, U.weight());
+        EditText amount = U.input(this, true);
+        amount.setGravity(Gravity.END);
+        amount.setHint("0");
+        if (usual != null || current != null) amount.setText(U.plain(current == null ? 0 : current));
+        row.addView(amount, new LinearLayout.LayoutParams(U.dp(this, 84), -2));
+        TextView unit = U.muted(this, i.unit);
+        unit.setMinWidth(U.dp(this, 36));
+        unit.setPadding(U.dp(this, 4), 0, 0, 0);
+        row.addView(unit);
+        rows.addView(row);
+        fields.put(i.id, amount);
+        return amount;
     }
 
     private boolean save() {

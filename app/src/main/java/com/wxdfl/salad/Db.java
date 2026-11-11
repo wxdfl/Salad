@@ -7,6 +7,7 @@ import android.database.sqlite.SQLiteDatabase;
 import android.database.sqlite.SQLiteOpenHelper;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -38,13 +39,14 @@ final class Db extends SQLiteOpenHelper {
     }
 
     private Db(Context c) {
-        super(c, FILE, null, 2);
+        super(c, FILE, null, 3);
     }
 
     @Override
     public void onCreate(SQLiteDatabase d) {
         d.execSQL("CREATE TABLE ingredient(id INTEGER PRIMARY KEY, name TEXT NOT NULL, unit TEXT NOT NULL,"
-                + " pack_qty REAL NOT NULL, pack_price REAL NOT NULL, stock REAL NOT NULL DEFAULT 0)");
+                + " pack_qty REAL NOT NULL, pack_price REAL NOT NULL, stock REAL NOT NULL DEFAULT 0,"
+                + " ticked INTEGER NOT NULL DEFAULT 0)");
         d.execSQL("CREATE TABLE recipe(id INTEGER PRIMARY KEY, name TEXT NOT NULL, price REAL NOT NULL)");
         d.execSQL("CREATE TABLE recipe_item(recipe_id INTEGER NOT NULL, ingredient_id INTEGER NOT NULL,"
                 + " qty REAL NOT NULL, unit TEXT)");
@@ -52,7 +54,9 @@ final class Db extends SQLiteOpenHelper {
         d.execSQL("CREATE TABLE orders(id INTEGER PRIMARY KEY, customer TEXT, note TEXT, due TEXT,"
                 + " status INTEGER NOT NULL DEFAULT 0, done_date TEXT)");
         d.execSQL("CREATE TABLE order_item(order_id INTEGER NOT NULL, recipe_id INTEGER NOT NULL,"
-                + " name TEXT NOT NULL, qty INTEGER NOT NULL, price REAL NOT NULL, cost REAL NOT NULL DEFAULT 0)");
+                + " name TEXT NOT NULL, qty INTEGER NOT NULL, price REAL NOT NULL, cost REAL NOT NULL DEFAULT 0,"
+                + " line INTEGER, custom TEXT)");
+        d.execSQL(CREATE_MODS);
         d.execSQL("CREATE TABLE expense(id INTEGER PRIMARY KEY, date TEXT NOT NULL, category TEXT NOT NULL,"
                 + " amount REAL NOT NULL, note TEXT)");
     }
@@ -61,11 +65,26 @@ final class Db extends SQLiteOpenHelper {
     private static final String CREATE_UNITS = "CREATE TABLE ingredient_unit(ingredient_id INTEGER NOT NULL,"
             + " name TEXT NOT NULL, factor REAL NOT NULL)";
 
+    /**
+     * A change to one ingredient of one order line, per serving: {@code none} leaves it out,
+     * otherwise {@code delta} (in the base unit) is added to what the recipe normally uses.
+     */
+    private static final String CREATE_MODS = "CREATE TABLE order_mod(order_id INTEGER NOT NULL,"
+            + " line INTEGER NOT NULL, ingredient_id INTEGER NOT NULL, delta REAL NOT NULL DEFAULT 0,"
+            + " none INTEGER NOT NULL DEFAULT 0)";
+
     @Override
     public void onUpgrade(SQLiteDatabase d, int oldVersion, int newVersion) {
         if (oldVersion < 2) {
             d.execSQL(CREATE_UNITS);
             d.execSQL("ALTER TABLE recipe_item ADD COLUMN unit TEXT");
+        }
+        if (oldVersion < 3) {
+            d.execSQL(CREATE_MODS);
+            d.execSQL("ALTER TABLE order_item ADD COLUMN line INTEGER");
+            d.execSQL("ALTER TABLE order_item ADD COLUMN custom TEXT");
+            d.execSQL("UPDATE order_item SET line = rowid");
+            d.execSQL("ALTER TABLE ingredient ADD COLUMN ticked INTEGER NOT NULL DEFAULT 0");
         }
     }
 
@@ -75,6 +94,8 @@ final class Db extends SQLiteOpenHelper {
         long id;
         String name = "", unit = "g";
         double packQty = 1, packPrice, stock;
+        /** Ticked off on the shopping list. */
+        boolean ticked;
         /** Other units this ingredient can be counted in, e.g. 1 can = 250 g. */
         List<Unit> units = new ArrayList<>();
     }
@@ -118,9 +139,20 @@ final class Db extends SQLiteOpenHelper {
 
     static final class OrderItem {
         long recipeId;
-        String name;
-        int qty;
+        /** {@code custom} describes the changes for this order, e.g. "no Tomatoes"; empty if none. */
+        String name, custom = "";
+        /** {@code line} is the position within the order. */
+        int qty, line;
         double price, cost;
+        List<Mod> mods = new ArrayList<>();
+    }
+
+    /** A change to one ingredient for one order line: left out, or more/less per serving. */
+    static final class Mod {
+        long ingredientId;
+        String name, unit;
+        double delta;
+        boolean none;
     }
 
     static final class Expense {
@@ -131,11 +163,11 @@ final class Db extends SQLiteOpenHelper {
 
     /** Total amount of one ingredient needed, compared with what is in stock. */
     static final class Need {
+        Ingredient ingredient;
         String name, unit;
         double need, stock, unitCost;
-        /** A bigger unit to shop in (e.g. can), or null; one of it equals {@code buyFactor} base units. */
-        String buyUnit;
-        double buyFactor;
+        /** A bigger unit to shop in (e.g. can), or null. */
+        Unit buyUnit;
 
         double toBuy() {
             return Math.max(0, need - stock);
@@ -152,7 +184,7 @@ final class Db extends SQLiteOpenHelper {
     List<Ingredient> ingredients() {
         List<Ingredient> out = new ArrayList<>();
         try (Cursor c = getReadableDatabase().rawQuery(
-                "SELECT id, name, unit, pack_qty, pack_price, stock FROM ingredient"
+                "SELECT id, name, unit, pack_qty, pack_price, stock, ticked FROM ingredient"
                         + " ORDER BY name COLLATE NOCASE", null)) {
             while (c.moveToNext()) {
                 Ingredient i = new Ingredient();
@@ -162,6 +194,7 @@ final class Db extends SQLiteOpenHelper {
                 i.packQty = c.getDouble(3);
                 i.packPrice = c.getDouble(4);
                 i.stock = c.getDouble(5);
+                i.ticked = c.getInt(6) == 1;
                 out.add(i);
             }
         }
@@ -225,6 +258,7 @@ final class Db extends SQLiteOpenHelper {
         try {
             d.delete("recipe_item", "ingredient_id=?", arg(id));
             d.delete("ingredient_unit", "ingredient_id=?", arg(id));
+            d.delete("order_mod", "ingredient_id=?", arg(id));
             d.delete("ingredient", "id=?", arg(id));
             d.setTransactionSuccessful();
         } finally {
@@ -242,7 +276,7 @@ final class Db extends SQLiteOpenHelper {
         SQLiteDatabase d = getWritableDatabase();
         d.beginTransaction();
         try {
-            d.execSQL("UPDATE ingredient SET stock = stock + ?, pack_qty = ?, pack_price = ? WHERE id = ?",
+            d.execSQL("UPDATE ingredient SET stock = stock + ?, pack_qty = ?, pack_price = ?, ticked = 0 WHERE id = ?",
                     new Object[]{base, base, paid, i.id});
             Expense e = new Expense();
             e.date = date;
@@ -335,8 +369,12 @@ final class Db extends SQLiteOpenHelper {
         d.beginTransaction();
         try {
             d.delete("recipe_item", "recipe_id=?", arg(id));
-            d.delete("order_item",
-                    "recipe_id=? AND order_id IN (SELECT id FROM orders WHERE status = 0)", arg(id));
+            String open = "recipe_id = ? AND order_id IN (SELECT id FROM orders WHERE status = 0)";
+            d.execSQL("DELETE FROM order_mod WHERE EXISTS (SELECT 1 FROM order_item WHERE"
+                    + " order_item.order_id = order_mod.order_id AND order_item.line = order_mod.line"
+                    + " AND order_item." + open.replace("AND order_id", "AND order_item.order_id") + ")",
+                    new Object[]{id});
+            d.delete("order_item", open, arg(id));
             d.delete("recipe", "id=?", arg(id));
             d.setTransactionSuccessful();
         } finally {
@@ -352,7 +390,8 @@ final class Db extends SQLiteOpenHelper {
         try (Cursor c = getReadableDatabase().rawQuery(
                 "SELECT o.id, o.customer, o.note, o.due, o.status, o.done_date,"
                         + " (SELECT SUM(qty * price) FROM order_item WHERE order_id = o.id),"
-                        + " (SELECT GROUP_CONCAT(qty || '× ' || name, ', ') FROM order_item WHERE order_id = o.id)"
+                        + " (SELECT GROUP_CONCAT(qty || '× ' || name || CASE WHEN COALESCE(custom, '') = ''"
+                        + " THEN '' ELSE ' (' || custom || ')' END, ', ') FROM order_item WHERE order_id = o.id)"
                         + " FROM orders o ORDER BY o.status,"
                         + " CASE o.status WHEN 0 THEN o.due END, o.done_date DESC, o.id DESC", null)) {
             while (c.moveToNext()) {
@@ -379,21 +418,41 @@ final class Db extends SQLiteOpenHelper {
     /** For an order that is not completed, {@code cost} is today's ingredient cost of one serving. */
     List<OrderItem> orderItems(long orderId) {
         List<OrderItem> out = new ArrayList<>();
+        boolean done = false;
         try (Cursor c = getReadableDatabase().rawQuery(
-                "SELECT oi.recipe_id, oi.name, oi.qty, oi.price, CASE o.status WHEN 1 THEN oi.cost ELSE"
-                        + " COALESCE((SELECT SUM(" + BASE_QTY + " * " + UNIT_COST + ") FROM recipe_item ri"
-                        + " JOIN ingredient i ON i.id = ri.ingredient_id WHERE ri.recipe_id = oi.recipe_id), 0) END"
+                "SELECT oi.line, oi.recipe_id, oi.name, oi.qty, oi.price, oi.cost, oi.custom, o.status"
                         + " FROM order_item oi JOIN orders o ON o.id = oi.order_id WHERE oi.order_id = ?"
-                        + " ORDER BY oi.rowid", arg(orderId))) {
+                        + " ORDER BY oi.line, oi.rowid", arg(orderId))) {
             while (c.moveToNext()) {
                 OrderItem it = new OrderItem();
-                it.recipeId = c.getLong(0);
-                it.name = c.getString(1);
-                it.qty = c.getInt(2);
-                it.price = c.getDouble(3);
-                it.cost = c.getDouble(4);
+                it.line = c.getInt(0);
+                it.recipeId = c.getLong(1);
+                it.name = c.getString(2);
+                it.qty = c.getInt(3);
+                it.price = c.getDouble(4);
+                it.cost = c.getDouble(5);
+                it.custom = c.isNull(6) ? "" : c.getString(6);
+                done = c.getInt(7) == 1;
                 out.add(it);
             }
+        }
+        try (Cursor c = getReadableDatabase().rawQuery(
+                "SELECT m.line, m.ingredient_id, i.name, i.unit, m.delta, m.none FROM order_mod m"
+                        + " JOIN ingredient i ON i.id = m.ingredient_id WHERE m.order_id = ? ORDER BY m.rowid",
+                arg(orderId))) {
+            while (c.moveToNext()) {
+                Mod m = new Mod();
+                m.ingredientId = c.getLong(1);
+                m.name = c.getString(2);
+                m.unit = c.getString(3);
+                m.delta = c.getDouble(4);
+                m.none = c.getInt(5) == 1;
+                for (OrderItem it : out) if (it.line == c.getInt(0)) it.mods.add(m);
+            }
+        }
+        if (!done) {
+            Map<Long, Double> unitCosts = unitCosts();
+            for (OrderItem it : out) it.cost = cost(servingAmounts(it.recipeId, it.mods), unitCosts);
         }
         return out;
     }
@@ -409,14 +468,29 @@ final class Db extends SQLiteOpenHelper {
             if (o.id == 0) o.id = d.insert("orders", null, v);
             else d.update("orders", v, "id=?", arg(o.id));
             d.delete("order_item", "order_id=?", arg(o.id));
+            d.delete("order_mod", "order_id=?", arg(o.id));
+            int line = 0;
             for (OrderItem it : items) {
+                it.line = ++line;
+                it.custom = describe(it.mods);
                 ContentValues iv = new ContentValues();
                 iv.put("order_id", o.id);
+                iv.put("line", it.line);
                 iv.put("recipe_id", it.recipeId);
                 iv.put("name", it.name);
                 iv.put("qty", it.qty);
                 iv.put("price", it.price);
+                iv.put("custom", it.custom);
                 d.insert("order_item", null, iv);
+                for (Mod m : it.mods) {
+                    ContentValues mv = new ContentValues();
+                    mv.put("order_id", o.id);
+                    mv.put("line", it.line);
+                    mv.put("ingredient_id", m.ingredientId);
+                    mv.put("delta", m.delta);
+                    mv.put("none", m.none ? 1 : 0);
+                    d.insert("order_mod", null, mv);
+                }
             }
             d.setTransactionSuccessful();
         } finally {
@@ -429,6 +503,7 @@ final class Db extends SQLiteOpenHelper {
         d.beginTransaction();
         try {
             d.delete("order_item", "order_id=?", arg(id));
+            d.delete("order_mod", "order_id=?", arg(id));
             d.delete("orders", "id=?", arg(id));
             d.setTransactionSuccessful();
         } finally {
@@ -441,15 +516,15 @@ final class Db extends SQLiteOpenHelper {
         SQLiteDatabase d = getWritableDatabase();
         d.beginTransaction();
         try {
-            d.execSQL("UPDATE ingredient SET stock = MAX(0, stock - (SELECT SUM(" + BASE_QTY + " * oi.qty)"
-                    + " FROM order_item oi JOIN recipe_item ri ON ri.recipe_id = oi.recipe_id"
-                    + " WHERE oi.order_id = ?1 AND ri.ingredient_id = ingredient.id))"
-                    + " WHERE id IN (SELECT ri.ingredient_id FROM order_item oi"
-                    + " JOIN recipe_item ri ON ri.recipe_id = oi.recipe_id WHERE oi.order_id = ?1)",
-                    new Object[]{id});
-            d.execSQL("UPDATE order_item SET cost = COALESCE((SELECT SUM(" + BASE_QTY + " * " + UNIT_COST + ")"
-                    + " FROM recipe_item ri JOIN ingredient i ON i.id = ri.ingredient_id"
-                    + " WHERE ri.recipe_id = order_item.recipe_id), 0) WHERE order_id = ?", new Object[]{id});
+            List<OrderItem> items = orderItems(id);
+            for (Need n : needsFor(items)) {
+                d.execSQL("UPDATE ingredient SET stock = MAX(0, stock - ?) WHERE id = ?",
+                        new Object[]{n.need, n.ingredient.id});
+            }
+            for (OrderItem it : items) {
+                d.execSQL("UPDATE order_item SET cost = ? WHERE order_id = ? AND line = ?",
+                        new Object[]{it.cost, id, it.line});
+            }
             d.execSQL("UPDATE orders SET status = 1, done_date = ? WHERE id = ?", new Object[]{date, id});
             d.setTransactionSuccessful();
         } finally {
@@ -466,49 +541,106 @@ final class Db extends SQLiteOpenHelper {
 
     // ----------------------------------------------------------------- needs
 
-    /** Ingredients needed for every order that is not completed yet. */
-    List<Need> pendingNeeds() {
-        return needs("SELECT oi.recipe_id, oi.qty FROM order_item oi"
-                + " JOIN orders o ON o.id = oi.order_id WHERE o.status = 0");
-    }
-
-    /** Ingredients needed to make the given servings (recipe id -> number of servings). */
-    List<Need> needsFor(Map<Long, Integer> servings) {
-        if (servings.isEmpty()) return new ArrayList<>();
-        StringBuilder sql = new StringBuilder();
-        for (Map.Entry<Long, Integer> e : servings.entrySet()) {
-            if (sql.length() > 0) sql.append(" UNION ALL ");
-            sql.append("SELECT ").append(e.getKey()).append(" AS recipe_id, ").append(e.getValue()).append(" AS qty");
-        }
-        return needs(sql.toString());
-    }
-
-    /** SQL for a column (#) of the first unit of ingredient {@code i} that is bigger than its base unit. */
-    private static final String BUY_UNIT = "(SELECT u.# FROM ingredient_unit u"
-            + " WHERE u.ingredient_id = i.id AND u.factor > 1 ORDER BY u.rowid LIMIT 1)";
-
-    /** @param servingsSql a query returning (recipe_id, qty) rows */
-    private List<Need> needs(String servingsSql) {
-        List<Need> out = new ArrayList<>();
-        try (Cursor c = getReadableDatabase().rawQuery(
-                "SELECT i.name, i.unit, SUM(" + BASE_QTY + " * s.qty), i.stock, " + UNIT_COST + ", "
-                        + BUY_UNIT.replace("#", "name") + ", " + BUY_UNIT.replace("#", "factor")
-                        + " FROM (" + servingsSql + ") s JOIN recipe_item ri ON ri.recipe_id = s.recipe_id"
-                        + " JOIN ingredient i ON i.id = ri.ingredient_id"
-                        + " GROUP BY i.id ORDER BY i.name COLLATE NOCASE", null)) {
-            while (c.moveToNext()) {
-                Need n = new Need();
-                n.name = c.getString(0);
-                n.unit = c.getString(1);
-                n.need = c.getDouble(2);
-                n.stock = c.getDouble(3);
-                n.unitCost = c.getDouble(4);
-                n.buyUnit = c.getString(5);
-                n.buyFactor = c.getDouble(6);
-                out.add(n);
-            }
+    /** What a recipe normally puts into one serving: ingredient id -> amount in its base unit. */
+    Map<Long, Double> recipeAmounts(long recipeId) {
+        Map<Long, Double> out = new LinkedHashMap<>();
+        try (Cursor c = getReadableDatabase().rawQuery("SELECT ri.ingredient_id, " + BASE_QTY
+                + " FROM recipe_item ri WHERE ri.recipe_id = ? ORDER BY ri.rowid", arg(recipeId))) {
+            while (c.moveToNext()) out.merge(c.getLong(0), c.getDouble(1), Double::sum);
         }
         return out;
+    }
+
+    /** What goes into one serving once an order's changes (extra, less, none) are applied. */
+    Map<Long, Double> servingAmounts(long recipeId, List<Mod> mods) {
+        Map<Long, Double> out = recipeAmounts(recipeId);
+        for (Mod m : mods) {
+            double amount = m.none ? 0 : out.getOrDefault(m.ingredientId, 0.0) + m.delta;
+            if (amount > 0) out.put(m.ingredientId, amount);
+            else out.remove(m.ingredientId);
+        }
+        return out;
+    }
+
+    /** Ingredient cost of one serving, with the order's changes applied. */
+    double servingCost(long recipeId, List<Mod> mods) {
+        return cost(servingAmounts(recipeId, mods), unitCosts());
+    }
+
+    private static double cost(Map<Long, Double> amounts, Map<Long, Double> unitCosts) {
+        double total = 0;
+        for (Map.Entry<Long, Double> e : amounts.entrySet()) {
+            total += e.getValue() * unitCosts.getOrDefault(e.getKey(), 0.0);
+        }
+        return total;
+    }
+
+    private Map<Long, Double> unitCosts() {
+        Map<Long, Double> out = new HashMap<>();
+        for (Ingredient i : ingredients()) out.put(i.id, i.packPrice / i.packQty);
+        return out;
+    }
+
+    /** Short text for an order line's changes, e.g. "no Tomatoes, +50 g Lettuce". */
+    static String describe(List<Mod> mods) {
+        StringBuilder sb = new StringBuilder();
+        for (Mod m : mods) {
+            if (sb.length() > 0) sb.append(", ");
+            if (m.none) sb.append("no ").append(m.name);
+            else sb.append(m.delta > 0 ? "+" : "−").append(U.num(Math.abs(m.delta)))
+                    .append(" ").append(m.unit).append(" ").append(m.name);
+        }
+        return sb.toString();
+    }
+
+    /** Ingredients needed for every order that is not completed yet. */
+    List<Need> pendingNeeds() {
+        List<OrderItem> items = new ArrayList<>();
+        try (Cursor c = getReadableDatabase().rawQuery("SELECT id FROM orders WHERE status = 0", null)) {
+            while (c.moveToNext()) items.addAll(orderItems(c.getLong(0)));
+        }
+        return needsFor(items);
+    }
+
+    /** Ingredients needed to make the given order lines, sorted by name. */
+    List<Need> needsFor(List<OrderItem> items) {
+        Map<Long, Double> total = new HashMap<>();
+        for (OrderItem it : items) {
+            for (Map.Entry<Long, Double> e : servingAmounts(it.recipeId, it.mods).entrySet()) {
+                total.merge(e.getKey(), e.getValue() * it.qty, Double::sum);
+            }
+        }
+        List<Need> out = new ArrayList<>();
+        for (Ingredient i : ingredients()) {
+            Double need = total.get(i.id);
+            if (need == null) continue;
+            Need n = new Need();
+            n.ingredient = i;
+            n.name = i.name;
+            n.unit = i.unit;
+            n.need = need;
+            n.stock = i.stock;
+            n.unitCost = i.packPrice / i.packQty;
+            for (Unit u : i.units) {
+                if (u.factor > 1 && n.buyUnit == null) n.buyUnit = u;
+            }
+            out.add(n);
+        }
+        return out;
+    }
+
+    /** Forgets the ticks of everything that is not on the shopping list any more. */
+    void untickAllExcept(List<Long> ingredientIds) {
+        StringBuilder ids = new StringBuilder();
+        for (Long id : ingredientIds) ids.append(ids.length() == 0 ? "" : ", ").append(id);
+        getWritableDatabase().execSQL(
+                "UPDATE ingredient SET ticked = 0 WHERE ticked = 1 AND id NOT IN (" + ids + ")");
+    }
+
+    /** Ticks an ingredient off the shopping list (or unticks it). */
+    void setTicked(long ingredientId, boolean ticked) {
+        getWritableDatabase().execSQL("UPDATE ingredient SET ticked = ? WHERE id = ?",
+                new Object[]{ticked ? 1 : 0, ingredientId});
     }
 
     // -------------------------------------------------------------- expenses
