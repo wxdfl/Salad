@@ -6,19 +6,19 @@ import android.os.Bundle;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.MenuItem;
+import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 /** Add or edit an order, see what it needs, and mark it as completed (sold). */
 public class OrderActivity extends Activity {
@@ -233,41 +233,48 @@ public class OrderActivity extends Activity {
         }).show();
     }
 
-    /** Changes one order line for this order only: its price and how much of each ingredient. */
+    /** Changes one order line for this order only: its price, and extra / less / no of an ingredient. */
     private void customise(Db.OrderItem it) {
         Map<Long, Double> normal = db.recipeAmounts(it.recipeId);
-        Map<Long, Double> current = db.servingAmounts(it.recipeId, it.mods);
         List<Db.Ingredient> all = db.ingredients();
-        Map<Long, EditText> fields = new LinkedHashMap<>();
+        Map<Long, Choice> choices = new LinkedHashMap<>();
 
         LinearLayout form = U.column(this);
         EditText price = U.input(this, true);
         price.setText(U.plain(it.price));
         U.field(form, "Price each (" + U.currency(this) + ")", price);
-        form.addView(U.sectionTitle(this, "Amount in each serving"));
-        form.addView(U.muted(this, "For this order only. Put 0 to leave something out, or a bigger number"
-                + " for extra. If only some servings are different, add the item again as its own line."));
+        form.addView(U.sectionTitle(this, "Ingredients"));
+        form.addView(U.muted(this, "For this order only. If only some servings are different, add the item"
+                + " again as its own line. What extra and less mean is set per ingredient in the Stock tab."));
         LinearLayout rows = U.column(this);
         form.addView(rows);
-        Set<Long> ids = new LinkedHashSet<>(normal.keySet());
-        ids.addAll(current.keySet());
         for (Db.Ingredient i : all) {
-            if (ids.contains(i.id)) amountRow(rows, fields, i, normal.get(i.id), current.get(i.id));
+            Db.Mod current = null;
+            for (Db.Mod m : it.mods) if (m.ingredientId == i.id) current = m;
+            if (normal.containsKey(i.id) || current != null) {
+                choiceRow(rows, choices, i, normal.getOrDefault(i.id, 0.0), current);
+            }
         }
         Button add = new Button(this, null, android.R.attr.borderlessButtonStyle);
         add.setText("＋ Add another ingredient");
         add.setTextColor(getColor(R.color.accent));
         add.setOnClickListener(v -> {
-            List<Db.Ingredient> choices = new ArrayList<>();
-            for (Db.Ingredient i : all) if (!fields.containsKey(i.id)) choices.add(i);
-            if (choices.isEmpty()) {
+            List<Db.Ingredient> others = new ArrayList<>();
+            for (Db.Ingredient i : all) if (!choices.containsKey(i.id)) others.add(i);
+            if (others.isEmpty()) {
                 toast("Every ingredient is already listed");
                 return;
             }
-            String[] labels = new String[choices.size()];
-            for (int i = 0; i < labels.length; i++) labels[i] = choices.get(i).name;
-            new AlertDialog.Builder(this).setTitle("Add ingredient").setItems(labels, (d, which) ->
-                    amountRow(rows, fields, choices.get(which), null, null).requestFocus()).show();
+            String[] labels = new String[others.size()];
+            for (int i = 0; i < labels.length; i++) labels[i] = others.get(i).name;
+            new AlertDialog.Builder(this).setTitle("Add ingredient").setItems(labels, (d, which) -> {
+                Db.Ingredient i = others.get(which);
+                if (i.extraQty <= 0) {
+                    toast("First set what \"extra\" means for " + i.name + " (Stock tab → Edit)");
+                    return;
+                }
+                choiceRow(rows, choices, i, 0, null).spinner.setSelection(1);
+            }).show();
         });
         form.addView(add);
 
@@ -279,25 +286,9 @@ public class OrderActivity extends Activity {
                 return false;
             }
             List<Db.Mod> mods = new ArrayList<>();
-            for (Db.Ingredient i : all) {
-                EditText field = fields.get(i.id);
-                if (field == null) continue;
-                double usual = normal.getOrDefault(i.id, 0.0);
-                String typed = field.getText().toString().trim();
-                double amount = typed.isEmpty() ? usual : U.parse(typed);   // left blank = as usual
-                if (!(amount >= 0)) {
-                    field.setError("Enter an amount, or 0 for none");
-                    field.requestFocus();
-                    return false;
-                }
-                if (Math.abs(amount - usual) < 1e-9) continue;
-                Db.Mod m = new Db.Mod();
-                m.ingredientId = i.id;
-                m.name = i.name;
-                m.unit = i.unit;
-                m.none = amount == 0;
-                m.delta = m.none ? 0 : amount - usual;
-                mods.add(m);
+            for (Choice ch : choices.values()) {
+                Db.Mod m = ch.mods[ch.spinner.getSelectedItemPosition()];
+                if (m != null) mods.add(m);
             }
             it.price = p;
             it.mods = mods;
@@ -308,26 +299,73 @@ public class OrderActivity extends Activity {
         }, null);
     }
 
-    /** One "ingredient  [amount] unit" row of the customise form; returns the amount field. */
-    private EditText amountRow(LinearLayout rows, Map<Long, EditText> fields, Db.Ingredient i,
-                               Double usual, Double current) {
+    /** A drop-down of one ingredient, with the change each of its options stands for (null = as usual). */
+    private static final class Choice {
+        Spinner spinner;
+        Db.Mod[] mods;
+    }
+
+    /**
+     * One "ingredient  [Normal / Extra / Less / No]" row of the customise form.
+     *
+     * @param usual   how much the recipe has per serving (0 when it is not in the recipe)
+     * @param current the change this order line already has for the ingredient, or null
+     */
+    private Choice choiceRow(LinearLayout rows, Map<Long, Choice> choices, Db.Ingredient i,
+                             double usual, Db.Mod current) {
+        // "Extra" and "less" come from the ingredient's presets; without one, half the recipe amount.
+        double extra = i.extraQty > 0 ? i.extraQty : usual / 2;
+        double less = Math.min(usual, i.lessQty > 0 ? i.lessQty : usual / 2);
+        // An amount this line already carries is kept as it is unless another option is picked.
+        if (current != null && !current.none && current.delta > 0) extra = current.delta;
+        if (current != null && !current.none && current.delta < 0) less = -current.delta;
+
+        List<String> labels = new ArrayList<>();
+        List<Db.Mod> mods = new ArrayList<>();
+        labels.add(usual > 0 ? "Normal" : "Not added");
+        mods.add(null);
+        if (extra > 0) {
+            labels.add("Extra (+" + U.num(extra) + " " + i.unit + ")");
+            mods.add(mod(i, extra, false));
+        }
+        if (usual > 0 && less > 0) {
+            labels.add("Less (−" + U.num(less) + " " + i.unit + ")");
+            mods.add(mod(i, -less, false));
+        }
+        if (usual > 0) {
+            labels.add("No " + i.name);
+            mods.add(mod(i, 0, true));
+        }
+        Choice choice = new Choice();
+        choice.mods = mods.toArray(new Db.Mod[0]);
+        choice.spinner = new Spinner(this);
+        choice.spinner.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, labels));
+        for (int n = 1; n < choice.mods.length; n++) {
+            Db.Mod m = choice.mods[n];
+            if (current != null && m.none == current.none && Math.signum(m.delta) == Math.signum(current.delta)) {
+                choice.spinner.setSelection(n);
+            }
+        }
+
         LinearLayout row = U.row(this);
         LinearLayout left = U.column(this);
         left.addView(U.text(this, i.name, 16, false));
-        left.addView(U.muted(this, usual == null ? "not in the recipe" : "usually " + U.num(usual) + " " + i.unit));
+        left.addView(U.muted(this, usual > 0 ? "usually " + U.num(usual) + " " + i.unit : "not in the recipe"));
         row.addView(left, U.weight());
-        EditText amount = U.input(this, true);
-        amount.setGravity(Gravity.END);
-        amount.setHint("0");
-        if (usual != null || current != null) amount.setText(U.plain(current == null ? 0 : current));
-        row.addView(amount, new LinearLayout.LayoutParams(U.dp(this, 84), -2));
-        TextView unit = U.muted(this, i.unit);
-        unit.setMinWidth(U.dp(this, 36));
-        unit.setPadding(U.dp(this, 4), 0, 0, 0);
-        row.addView(unit);
+        row.addView(choice.spinner);
         rows.addView(row);
-        fields.put(i.id, amount);
-        return amount;
+        choices.put(i.id, choice);
+        return choice;
+    }
+
+    private static Db.Mod mod(Db.Ingredient i, double delta, boolean none) {
+        Db.Mod m = new Db.Mod();
+        m.ingredientId = i.id;
+        m.name = i.name;
+        m.unit = i.unit;
+        m.delta = delta;
+        m.none = none;
+        return m;
     }
 
     private boolean save() {

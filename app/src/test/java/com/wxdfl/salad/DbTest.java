@@ -46,6 +46,10 @@ public class DbTest {
         i.packQty = packQty;
         i.packPrice = price;
         i.stock = stock;
+        if (packQty > 1) {                 // bought by the packet, measured in the small unit
+            i.units.add(new Db.Unit("pkt", packQty));
+            i.buyUnit = "pkt";
+        }
         db.saveIngredient(i);
         return i;
     }
@@ -189,10 +193,10 @@ public class DbTest {
         assertEquals(300, need(needs, "Chicken").need, 1e-9);        // unchanged
 
         Db.OrderItem saved = db.orderItems(o.id).get(0);
-        assertEquals("+50 g Lettuce, no Tomatoes", saved.custom);
+        assertEquals("extra Lettuce, no Tomatoes", saved.custom);
         assertEquals(2, saved.mods.size());
         assertEquals(2.30, saved.cost, 1e-9);                        // 2.55 + 0.25 lettuce - 0.50 tomato
-        assertEquals("2× Chicken Salad (+50 g Lettuce, no Tomatoes)", db.order(o.id).summary);
+        assertEquals("2× Chicken Salad (extra Lettuce, no Tomatoes)", db.order(o.id).summary);
         assertEquals(18, db.order(o.id).total, 1e-9);
 
         order(db, salad, 1, "2026-11-13");                           // a normal one alongside
@@ -210,7 +214,7 @@ public class DbTest {
         assertEquals(1, stock("Tomatoes").stock, 1e-9);              // untouched
         assertEquals(4.60, db.summary("2026-11").ingredientCost, 1e-9);
         assertEquals(18, db.summary("2026-11").sales, 1e-9);
-        assertEquals("+50 g Lettuce, no Tomatoes", db.orderItems(o.id).get(0).custom);
+        assertEquals("extra Lettuce, no Tomatoes", db.orderItems(o.id).get(0).custom);
     }
 
     @Test
@@ -224,7 +228,7 @@ public class DbTest {
         assertEquals(30, amounts.get(avocado.id), 1e-9);
         assertEquals(100, amounts.get(stock("Chicken").id), 1e-9);
         assertTrue(!amounts.containsKey(stock("Corn").id));
-        assertEquals("+30 g Avocado, −50 g Chicken, −80 g Corn", Db.describe(mods));
+        assertEquals("extra Avocado, less Chicken, less Corn", Db.describe(mods));
         assertEquals(2.55 + 0.60 - 0.45 - 0.20, db.servingCost(salad.id, mods), 1e-9);
 
         // Deleting the ingredient drops the change with it.
@@ -258,7 +262,9 @@ public class DbTest {
     /** Corn can also be counted in cans of 250 g; a "Corn cup" uses 1 can (costs 1.00). */
     private Db.Recipe cornCup() {
         Db.Ingredient corn = stock("Corn");
+        corn.units.clear();
         corn.units.add(new Db.Unit("can", 250));
+        corn.buyUnit = "can";
         db.saveIngredient(corn);
         Db.Recipe cup = new Db.Recipe();
         cup.name = "Corn cup";
@@ -284,8 +290,9 @@ public class DbTest {
         Db.Need corn = need(db.pendingNeeds(), "Corn");
         assertEquals(550, corn.need, 1e-9);
         assertEquals("can", corn.buyUnit.name);
-        assertEquals(2.2, corn.toBuy() / corn.buyUnit.factor, 1e-9);
-        assertEquals(null, need(db.pendingNeeds(), "Lettuce").buyUnit);
+        assertEquals("3 can", corn.buyText());                       // 2.2 cans, rounded up
+        assertEquals(3 * 250 * 1.6 / 400, corn.buyCost(), 1e-9);
+        assertEquals("0 pkt", need(db.pendingNeeds(), "Lettuce").buyText());
     }
 
     @Test
@@ -348,14 +355,75 @@ public class DbTest {
         assertEquals(0.4, db.recipe(1).cost, 1e-9);
         assertEquals(200, need(db.pendingNeeds(), "Corn").need, 1e-9);
         assertEquals(170, need(db.pendingNeeds(), "Corn").toBuy(), 1e-9);
-        assertTrue(stock("Corn").units.isEmpty());
+        assertEquals("pkt", stock("Corn").buyName());                // was "1.60 per 400 g"
+        assertEquals(400, stock("Corn").buySize(), 1e-9);
+        assertEquals("g", stock("Corn").unit);
         assertTrue(!stock("Corn").ticked);
         assertEquals("2× Corn cup", db.order(1).summary);
         db.completeOrder(1, "2026-11-12");                           // old order lines can still be completed
         assertEquals(0.4, db.orderItems(1).get(0).cost, 1e-9);
         assertEquals(0, stock("Corn").stock, 1e-9);
         cornCup();                                                   // the new feature works on old data
-        assertEquals("can", stock("Corn").units.get(0).name);
+        assertEquals("can", stock("Corn").buyName());
+    }
+
+    @Test
+    public void addingOrDroppingTheSmallUnitKeepsRecipesRight() {
+        // Tuna starts out counted in whole cans only.
+        Db.Ingredient tuna = ingredient(db, "Tuna", "can", 1, 2, 5);
+        Db.Recipe r = new Db.Recipe();
+        r.name = "Tuna salad";
+        r.price = 6;
+        db.saveRecipe(r, Collections.singletonList(line(tuna, 1)));
+        assertEquals(2, db.recipe(r.id).cost, 1e-9);
+
+        // Now: 1 can = 150 g, so amounts are kept in g.
+        tuna.unit = "g";
+        tuna.buyUnit = "can";
+        tuna.units.add(new Db.Unit("can", 150));
+        tuna.packQty = 150;
+        tuna.stock = 5 * 150;
+        db.saveIngredient(tuna);
+        Db.Line l = db.recipeLines(r.id).get(0);
+        assertEquals("can", l.useUnit);                              // the recipe still says 1 can
+        assertEquals(1, l.qty, 1e-9);
+        assertEquals(2, db.recipe(r.id).cost, 1e-9);
+        order(db, r, 2, "2026-11-12");
+        assertEquals(300, need(db.pendingNeeds(), "Tuna").need, 1e-9);
+        assertEquals("0 can", need(db.pendingNeeds(), "Tuna").buyText());
+
+        Db.Recipe half = new Db.Recipe();
+        half.name = "Tuna bites";
+        half.price = 3;
+        db.saveRecipe(half, Collections.singletonList(line(stock("Tuna"), 75)));
+        assertEquals(1, db.recipe(half.id).cost, 1e-9);
+
+        // And back to whole cans only.
+        tuna = stock("Tuna");
+        tuna.unit = "can";
+        tuna.buyUnit = null;
+        tuna.units.clear();
+        tuna.packQty = 1;
+        tuna.stock = 5;
+        db.saveIngredient(tuna);
+        assertEquals(null, db.recipeLines(r.id).get(0).useUnit);
+        assertEquals(1, db.recipeLines(r.id).get(0).qty, 1e-9);
+        assertEquals(0.5, db.recipeLines(half.id).get(0).qty, 1e-9); // 75 g is half a can
+        assertEquals(2, db.recipe(r.id).cost, 1e-9);
+        assertEquals(1, db.recipe(half.id).cost, 1e-9);
+        assertEquals(2, need(db.pendingNeeds(), "Tuna").need, 1e-9);
+    }
+
+    @Test
+    public void profitPerMonthForTheChart() {
+        Db.Order o = order(db, salad, 2, "2026-10-05");
+        db.completeOrder(o.id, "2026-10-05");                        // October: +16
+        db.recordPurchase(stock("Corn"), 1, null, 30, "2026-11-02"); // November: -30
+        double[] p = db.profits("2026-11", 3);
+        assertEquals(3, p.length);
+        assertEquals(0, p[0], 1e-9);
+        assertEquals(16, p[1], 1e-9);
+        assertEquals(-30, p[2], 1e-9);
     }
 
     @Test

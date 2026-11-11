@@ -137,6 +137,12 @@ public class MainActivity extends Activity {
                         getColor(profit < 0 ? R.color.bad : R.color.good)),
                 U.card(this, "Ingredient cost", U.money(this, s.ingredientCost), margin, 0)));
 
+        int months = 6;
+        String[] labels = new String[months];
+        for (int i = 0; i < months; i++) labels[i] = U.shortMonth(U.shiftMonth(month, i - months + 1));
+        col.addView(U.sectionTitle(this, "Profit by month"));
+        col.addView(new ProfitChart(this, labels, db().profits(month, months)));
+
         int pending = db().pendingOrderCount();
         TextView open = U.muted(this, pending == 0 ? "No open orders."
                 : pending + (pending == 1 ? " open order" : " open orders") + " · see the Shopping tab for what to buy.");
@@ -393,12 +399,10 @@ public class MainActivity extends Activity {
     private View stock() {
         List<Item> items = new ArrayList<>();
         for (Db.Ingredient i : db().ingredients()) {
-            StringBuilder sub = new StringBuilder(
-                    U.money(this, i.packPrice) + " per " + U.num(i.packQty) + " " + i.unit);
-            for (Db.Unit u : i.units) {
-                sub.append(" · 1 ").append(u.name).append(" = ").append(U.num(u.factor)).append(" ").append(i.unit);
-            }
-            items.add(new Item(i.name, sub.toString(), U.num(i.stock) + " " + i.unit, () -> ingredientMenu(i)));
+            String sub = U.money(this, i.unitCost() * i.buySize()) + " per " + i.buyName();
+            for (Db.Unit u : i.units) sub += " · 1 " + u.name + " = " + U.num(u.factor) + " " + i.unit;
+            items.add(new Item(i.name, sub, U.num(i.stock / i.buySize()) + " " + i.buyName(),
+                    () -> ingredientMenu(i)));
         }
         return listScreen(null, items,
                 "No ingredients yet.\n\nAdd the raw materials you buy, with their price and how much you have.",
@@ -430,7 +434,7 @@ public class MainActivity extends Activity {
             if (n.toBuy() <= 0) continue;
             buy.add(n);
             buyIds.add(n.ingredient.id);
-            cost += n.toBuy() * n.unitCost;
+            cost += n.buyCost();
         }
         db().untickAllExcept(buyIds);
         int pending = db().pendingOrderCount();
@@ -454,11 +458,25 @@ public class MainActivity extends Activity {
         } else {
             col.addView(U.text(this, "To make your " + (pending == 1 ? "open order" : pending + " open orders")
                     + " · about " + U.money(this, cost), 16, true));
-            TextView hint = U.muted(this, "Tick things off as you shop. When you've bought something,"
-                    + " tap its name to add it to your stock and expenses.");
+            TextView hint = U.muted(this, "Tick things off as you shop; tap Undo (or the box again) to untick."
+                    + " When you've bought something, tap its name to add it to your stock and expenses.");
             hint.setPadding(0, U.dp(this, 4), 0, U.dp(this, 8));
             col.addView(hint);
-            for (Db.Need n : buy) col.addView(shoppingRow(n));
+            boolean anyTicked = false;
+            for (Db.Need n : buy) {
+                col.addView(shoppingRow(n));
+                anyTicked |= n.ingredient.ticked;
+            }
+            if (anyTicked) {
+                Button clear = new Button(this, null, android.R.attr.borderlessButtonStyle);
+                clear.setText("Untick everything");
+                clear.setTextColor(getColor(R.color.accent));
+                clear.setOnClickListener(v -> {
+                    db().untickAllExcept(new ArrayList<>());
+                    refresh();
+                });
+                col.addView(clear);
+            }
         }
         boolean header = false;
         for (Db.Need n : needs) {
@@ -493,15 +511,24 @@ public class MainActivity extends Activity {
         left.addView(name);
         left.addView(U.muted(this, needText(n)));
         body.addView(left, U.weight());
-        TextView amount = U.text(this, U.num(n.toBuy()) + " " + n.unit + U.buyIn(n), 16, true);
+        TextView amount = U.text(this, n.buyText(), 16, true);
         amount.setGravity(Gravity.END);
         amount.setPadding(U.dp(this, 12), 0, 0, 0);
         body.addView(amount);
         body.setOnClickListener(v -> Dialogs.purchase(this, n.ingredient, n.toBuy(), this::refresh));
         row.addView(body, U.weight());
+        Button undo = new Button(this, null, android.R.attr.borderlessButtonStyle);
+        undo.setText("Undo");
+        undo.setContentDescription("Untick " + n.name);
+        undo.setTextColor(getColor(R.color.accent));
+        undo.setMinWidth(U.dp(this, 56));
+        undo.setMinimumWidth(U.dp(this, 56));
+        undo.setOnClickListener(v -> box.setChecked(false));
+        row.addView(undo);
 
         Runnable style = () -> {
             boolean got = box.isChecked();
+            undo.setVisibility(got ? View.VISIBLE : View.GONE);
             int strike = android.graphics.Paint.STRIKE_THRU_TEXT_FLAG;
             name.setPaintFlags(got ? name.getPaintFlags() | strike : name.getPaintFlags() & ~strike);
             name.setAlpha(got ? 0.5f : 1f);
@@ -510,7 +537,7 @@ public class MainActivity extends Activity {
         style.run();
         box.setOnCheckedChangeListener((button, checked) -> {
             db().setTicked(n.ingredient.id, checked);
-            style.run();
+            refresh();   // also shows or hides "Untick everything"
         });
         return row;
     }

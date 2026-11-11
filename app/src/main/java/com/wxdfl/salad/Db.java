@@ -39,14 +39,15 @@ final class Db extends SQLiteOpenHelper {
     }
 
     private Db(Context c) {
-        super(c, FILE, null, 3);
+        super(c, FILE, null, 4);
     }
 
     @Override
     public void onCreate(SQLiteDatabase d) {
         d.execSQL("CREATE TABLE ingredient(id INTEGER PRIMARY KEY, name TEXT NOT NULL, unit TEXT NOT NULL,"
                 + " pack_qty REAL NOT NULL, pack_price REAL NOT NULL, stock REAL NOT NULL DEFAULT 0,"
-                + " ticked INTEGER NOT NULL DEFAULT 0)");
+                + " ticked INTEGER NOT NULL DEFAULT 0, buy_unit TEXT,"
+                + " extra_qty REAL NOT NULL DEFAULT 0, less_qty REAL NOT NULL DEFAULT 0)");
         d.execSQL("CREATE TABLE recipe(id INTEGER PRIMARY KEY, name TEXT NOT NULL, price REAL NOT NULL)");
         d.execSQL("CREATE TABLE recipe_item(recipe_id INTEGER NOT NULL, ingredient_id INTEGER NOT NULL,"
                 + " qty REAL NOT NULL, unit TEXT)");
@@ -86,14 +87,54 @@ final class Db extends SQLiteOpenHelper {
             d.execSQL("UPDATE order_item SET line = rowid");
             d.execSQL("ALTER TABLE ingredient ADD COLUMN ticked INTEGER NOT NULL DEFAULT 0");
         }
+        if (oldVersion < 4) {
+            d.execSQL("ALTER TABLE ingredient ADD COLUMN buy_unit TEXT");
+            d.execSQL("ALTER TABLE ingredient ADD COLUMN extra_qty REAL NOT NULL DEFAULT 0");
+            d.execSQL("ALTER TABLE ingredient ADD COLUMN less_qty REAL NOT NULL DEFAULT 0");
+            // The unit an ingredient is bought in becomes its main unit: an existing bigger unit
+            // (1 can = 250 g) if there is one, otherwise a "pkt" of the size it was usually bought in.
+            String bigger = "(SELECT u.name FROM ingredient_unit u WHERE u.ingredient_id = ingredient.id"
+                    + " AND u.factor > 1 ORDER BY u.rowid LIMIT 1)";
+            d.execSQL("UPDATE ingredient SET buy_unit = " + bigger);
+            d.execSQL("INSERT INTO ingredient_unit(ingredient_id, name, factor) SELECT id,"
+                    + " CASE WHEN lower(unit) = 'pkt' THEN 'pack' ELSE 'pkt' END, pack_qty"
+                    + " FROM ingredient WHERE buy_unit IS NULL AND pack_qty > 1");
+            d.execSQL("UPDATE ingredient SET buy_unit = " + bigger + " WHERE buy_unit IS NULL");
+        }
     }
 
     // ---------------------------------------------------------------- models
 
+    /**
+     * Amounts (stock, recipes, needs) are always kept in {@code unit}, the small unit (e.g. g).
+     * {@code buyUnit} names the entry of {@code units} it is bought and shown in (e.g. can);
+     * null means it is bought in {@code unit} itself.
+     */
     static final class Ingredient {
         long id;
-        String name = "", unit = "g";
+        String name = "", unit = "", buyUnit;
         double packQty = 1, packPrice, stock;
+        /** What "extra" and "less" mean on a custom order, in {@code unit}; 0 = half the recipe amount. */
+        double extraQty, lessQty;
+
+        /** The unit this is bought in, or null when that is {@code unit} itself. */
+        Unit buy() {
+            for (Unit u : units) if (u.name.equals(buyUnit)) return u;
+            return null;
+        }
+
+        String buyName() {
+            return buy() == null ? unit : buy().name;
+        }
+
+        /** How many {@code unit} are in one buying unit. */
+        double buySize() {
+            return buy() == null ? 1 : buy().factor;
+        }
+
+        double unitCost() {
+            return packPrice / packQty;
+        }
         /** Ticked off on the shopping list. */
         boolean ticked;
         /** Other units this ingredient can be counted in, e.g. 1 can = 250 g. */
@@ -166,8 +207,22 @@ final class Db extends SQLiteOpenHelper {
         Ingredient ingredient;
         String name, unit;
         double need, stock, unitCost;
-        /** A bigger unit to shop in (e.g. can), or null. */
+        /** The unit it is bought in (e.g. can), or null when that is {@code unit}. */
         Unit buyUnit;
+
+        /** How many to buy, in the buying unit and rounded up to whole cans/packets. */
+        double buyCount() {
+            if (toBuy() <= 0) return 0;
+            return buyUnit == null ? toBuy() : Math.ceil(toBuy() / buyUnit.factor - 1e-9);
+        }
+
+        String buyText() {
+            return U.num(buyCount()) + " " + (buyUnit == null ? unit : buyUnit.name);
+        }
+
+        double buyCost() {
+            return buyCount() * (buyUnit == null ? 1 : buyUnit.factor) * unitCost;
+        }
 
         double toBuy() {
             return Math.max(0, need - stock);
@@ -184,7 +239,8 @@ final class Db extends SQLiteOpenHelper {
     List<Ingredient> ingredients() {
         List<Ingredient> out = new ArrayList<>();
         try (Cursor c = getReadableDatabase().rawQuery(
-                "SELECT id, name, unit, pack_qty, pack_price, stock, ticked FROM ingredient"
+                "SELECT id, name, unit, pack_qty, pack_price, stock, ticked, buy_unit, extra_qty, less_qty"
+                        + " FROM ingredient"
                         + " ORDER BY name COLLATE NOCASE", null)) {
             while (c.moveToNext()) {
                 Ingredient i = new Ingredient();
@@ -195,6 +251,9 @@ final class Db extends SQLiteOpenHelper {
                 i.packPrice = c.getDouble(4);
                 i.stock = c.getDouble(5);
                 i.ticked = c.getInt(6) == 1;
+                i.buyUnit = c.getString(7);
+                i.extraQty = c.getDouble(8);
+                i.lessQty = c.getDouble(9);
                 out.add(i);
             }
         }
@@ -209,12 +268,35 @@ final class Db extends SQLiteOpenHelper {
         return out;
     }
 
-    /** Saves the ingredient together with its list of other units. */
+    /**
+     * Saves the ingredient together with its units. Recipes and open orders are kept correct when
+     * the small unit is introduced (was counted in cans, now in g with 1 can = 250 g) or dropped.
+     */
     void saveIngredient(Ingredient i) {
+        Ingredient old = null;
+        for (Ingredient o : ingredients()) if (o.id == i.id) old = o;
         SQLiteDatabase d = getWritableDatabase();
         d.beginTransaction();
         try {
+            if (old != null && old.buy() == null && i.buy() != null && old.unit.equalsIgnoreCase(i.buyUnit)) {
+                // Amounts were in cans and are now in g: recipes keep saying "1 can".
+                double k = i.buySize();
+                d.execSQL("UPDATE recipe_item SET unit = ? WHERE ingredient_id = ? AND unit IS NULL",
+                        new Object[]{i.buyUnit, i.id});
+                d.execSQL("UPDATE order_mod SET delta = delta * ? WHERE ingredient_id = ?", new Object[]{k, i.id});
+            } else if (old != null && old.buy() != null && i.buy() == null && old.buyUnit.equalsIgnoreCase(i.unit)) {
+                // The other way round: amounts in g become amounts in cans.
+                double k = 1 / old.buySize();
+                d.execSQL("UPDATE recipe_item SET qty = qty * ? WHERE ingredient_id = ? AND unit IS NULL",
+                        new Object[]{k, i.id});
+                d.execSQL("UPDATE recipe_item SET unit = NULL WHERE ingredient_id = ? AND unit = ?",
+                        new Object[]{i.id, old.buyUnit});
+                d.execSQL("UPDATE order_mod SET delta = delta * ? WHERE ingredient_id = ?", new Object[]{k, i.id});
+            }
             ContentValues v = new ContentValues();
+            v.put("buy_unit", i.buy() == null ? null : i.buyUnit);
+            v.put("extra_qty", i.extraQty);
+            v.put("less_qty", i.lessQty);
             v.put("name", i.name);
             v.put("unit", i.unit);
             v.put("pack_qty", i.packQty);
@@ -577,18 +659,16 @@ final class Db extends SQLiteOpenHelper {
 
     private Map<Long, Double> unitCosts() {
         Map<Long, Double> out = new HashMap<>();
-        for (Ingredient i : ingredients()) out.put(i.id, i.packPrice / i.packQty);
+        for (Ingredient i : ingredients()) out.put(i.id, i.unitCost());
         return out;
     }
 
-    /** Short text for an order line's changes, e.g. "no Tomatoes, +50 g Lettuce". */
+    /** Short text for an order line's changes, e.g. "extra Lettuce, no Tomatoes". */
     static String describe(List<Mod> mods) {
         StringBuilder sb = new StringBuilder();
         for (Mod m : mods) {
             if (sb.length() > 0) sb.append(", ");
-            if (m.none) sb.append("no ").append(m.name);
-            else sb.append(m.delta > 0 ? "+" : "−").append(U.num(Math.abs(m.delta)))
-                    .append(" ").append(m.unit).append(" ").append(m.name);
+            sb.append(m.none ? "no " : m.delta > 0 ? "extra " : "less ").append(m.name);
         }
         return sb.toString();
     }
@@ -620,10 +700,8 @@ final class Db extends SQLiteOpenHelper {
             n.unit = i.unit;
             n.need = need;
             n.stock = i.stock;
-            n.unitCost = i.packPrice / i.packQty;
-            for (Unit u : i.units) {
-                if (u.factor > 1 && n.buyUnit == null) n.buyUnit = u;
-            }
+            n.unitCost = i.unitCost();
+            n.buyUnit = i.buy();
             out.add(n);
         }
         return out;
@@ -698,6 +776,16 @@ final class Db extends SQLiteOpenHelper {
             s.expenses = c.getDouble(0);
         }
         return s;
+    }
+
+    /** Sales minus expenses for each of the {@code count} months ending with {@code lastMonth}. */
+    double[] profits(String lastMonth, int count) {
+        double[] out = new double[count];
+        for (int i = 0; i < count; i++) {
+            Summary s = summary(U.shiftMonth(lastMonth, i - count + 1));
+            out[i] = s.sales - s.expenses;
+        }
+        return out;
     }
 
     private static String[] arg(long id) {

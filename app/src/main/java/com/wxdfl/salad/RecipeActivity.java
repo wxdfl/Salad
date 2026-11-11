@@ -190,7 +190,7 @@ public class RecipeActivity extends Activity {
         l.ingredientId = i.id;
         l.name = i.name;
         l.unit = i.unit;
-        l.unitCost = i.packPrice / i.packQty;
+        l.unitCost = i.unitCost();
         lines.add(l);
         showLines();
     }
