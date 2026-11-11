@@ -9,6 +9,8 @@ A small, offline Android app for running a home-based food business.
   Shows the cost and profit per serving.
 - **Stock** – your raw materials, their price and how much you have.
   "I bought more" adds stock and logs the expense in one step.
+  An ingredient can have extra units of any size you choose (1 can = 250 g, 1 scoop = 20 g…);
+  use them in recipes and when buying, and the shopping list shows how many cans to get.
 - **Expenses** – everything else you spend (packaging, gas, delivery…).
 - **Home** – sales, expenses and profit for the month, plus one combined
   shopping/prep list for all open orders.

@@ -25,7 +25,6 @@ import java.text.DecimalFormatSymbols;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.util.Calendar;
-import java.util.Currency;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
@@ -69,12 +68,7 @@ final class U {
 
     static String currency(Context c) {
         String saved = c.getSharedPreferences("settings", Context.MODE_PRIVATE).getString("currency", null);
-        if (saved != null) return saved;
-        try {
-            return Currency.getInstance(Locale.getDefault()).getSymbol();
-        } catch (RuntimeException e) {
-            return "$";
-        }
+        return saved != null ? saved : "$";
     }
 
     static void setCurrency(Context c, String symbol) {
@@ -216,7 +210,8 @@ final class U {
             double buy = n.toBuy();
             cost += buy * n.unitCost;
             table.addView(needRow(c, n.name, num(n.need) + " " + n.unit, num(n.stock),
-                    buy > 0 ? num(buy) + " " + n.unit : "✓", false,
+                    buy <= 0 ? "✓" : num(buy) + " " + n.unit
+                            + (n.buyUnit == null ? "" : "\n= " + num(buy / n.buyFactor) + " " + n.buyUnit), false,
                     c.getColor(buy > 0 ? R.color.bad : R.color.good)));
         }
         box.addView(table);

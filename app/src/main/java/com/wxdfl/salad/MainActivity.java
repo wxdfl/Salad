@@ -332,8 +332,12 @@ public class MainActivity extends Activity {
     private View stock() {
         List<Item> items = new ArrayList<>();
         for (Db.Ingredient i : db().ingredients()) {
-            String sub = U.money(this, i.packPrice) + " per " + U.num(i.packQty) + " " + i.unit;
-            items.add(new Item(i.name, sub, U.num(i.stock) + " " + i.unit, () -> ingredientMenu(i)));
+            StringBuilder sub = new StringBuilder(
+                    U.money(this, i.packPrice) + " per " + U.num(i.packQty) + " " + i.unit);
+            for (Db.Unit u : i.units) {
+                sub.append(" · 1 ").append(u.name).append(" = ").append(U.num(u.factor)).append(" ").append(i.unit);
+            }
+            items.add(new Item(i.name, sub.toString(), U.num(i.stock) + " " + i.unit, () -> ingredientMenu(i)));
         }
         return listScreen(null, items,
                 "No ingredients yet.\n\nAdd the raw materials you buy, with their price and how much you have.",

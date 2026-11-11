@@ -1,14 +1,18 @@
 package com.wxdfl.salad;
 
 import android.content.Context;
+import android.view.ViewGroup;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.Spinner;
+import android.widget.TextView;
 import android.widget.Toast;
 
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 
 /** The small pop-up forms: ingredient, purchase, expense. */
 final class Dialogs {
@@ -46,6 +50,24 @@ final class Dialogs {
         U.field(form, "…for this price (" + U.currency(c) + ")", packPrice);
         U.field(form, "In stock right now", stock);
 
+        // Other units: each row reads "1 [can] = [250] g".
+        form.addView(U.sectionTitle(c, "Other units (optional)"));
+        form.addView(U.muted(c, "For things you also count another way, e.g. 1 can = 250 g."
+                + " You can then use that unit in recipes and when you buy."));
+        LinearLayout unitsBox = U.column(c);
+        form.addView(unitsBox);
+        List<EditText[]> unitRows = new ArrayList<>();
+        List<TextView> baseLabels = new ArrayList<>();
+        U.onChange(unit, () -> {
+            for (TextView t : baseLabels) t.setText(unit.getText().toString().trim());
+        });
+        for (Db.Unit u : ing.units) addUnitRow(c, unitsBox, unitRows, baseLabels, unit, u);
+        Button addUnit = new Button(c, null, android.R.attr.borderlessButtonStyle);
+        addUnit.setText("＋ Add a unit");
+        addUnit.setTextColor(c.getColor(R.color.accent));
+        addUnit.setOnClickListener(v -> addUnitRow(c, unitsBox, unitRows, baseLabels, unit, null));
+        form.addView(addUnit);
+
         U.form(c, existing == null ? "New ingredient" : "Edit ingredient", form, () -> {
             String n = name.getText().toString().trim();
             String u = unit.getText().toString().trim();
@@ -57,6 +79,21 @@ final class Dialogs {
             if (!(q > 0)) return fail(packQty, "Enter an amount above 0");
             if (!(p >= 0)) return fail(packPrice, "Enter the price");
             if (!(s >= 0)) return fail(stock, "Enter a number");
+            List<Db.Unit> units = new ArrayList<>();
+            for (EditText[] row : unitRows) {
+                String un = row[0].getText().toString().trim();
+                String amount = row[1].getText().toString().trim();
+                if (un.isEmpty() && amount.isEmpty()) continue;   // an untouched row
+                double f = U.parse(amount);
+                if (un.isEmpty()) return fail(row[0], "Name this unit, e.g. can");
+                if (un.equalsIgnoreCase(u)) return fail(row[0], "Same as the main unit");
+                for (Db.Unit other : units) {
+                    if (other.name.equalsIgnoreCase(un)) return fail(row[0], "Already listed");
+                }
+                if (!(f > 0)) return fail(row[1], "How many " + u + " in 1 " + un + "?");
+                units.add(new Db.Unit(un, f));
+            }
+            ing.units = units;
             ing.name = n;
             ing.unit = u;
             ing.packQty = q;
@@ -68,12 +105,66 @@ final class Dialogs {
         }, null);
     }
 
+    /** Adds a "1 [name] = [amount] base-unit" row to the ingredient form. */
+    private static void addUnitRow(Context c, LinearLayout box, List<EditText[]> rows, List<TextView> baseLabels,
+                                   EditText baseUnit, Db.Unit existing) {
+        LinearLayout row = U.row(c);
+        EditText name = U.input(c, false);
+        name.setInputType(android.text.InputType.TYPE_CLASS_TEXT);
+        name.setHint("can");
+        EditText amount = U.input(c, true);
+        amount.setHint("250");
+        TextView base = U.muted(c, baseUnit.getText().toString().trim());
+        if (existing != null) {
+            name.setText(existing.name);
+            amount.setText(U.plain(existing.factor));
+        }
+        EditText[] fields = {name, amount};
+        Button remove = new Button(c, null, android.R.attr.borderlessButtonStyle);
+        remove.setText("✕");
+        remove.setContentDescription("Remove this unit");
+        remove.setMinWidth(U.dp(c, 44));
+        remove.setMinimumWidth(U.dp(c, 44));
+        remove.setOnClickListener(v -> {
+            rows.remove(fields);
+            baseLabels.remove(base);
+            box.removeView(row);
+        });
+        row.addView(U.text(c, "1", 16, false));
+        row.addView(name, U.weight());
+        row.addView(U.text(c, "=", 16, false));
+        row.addView(amount, new LinearLayout.LayoutParams(U.dp(c, 76), ViewGroup.LayoutParams.WRAP_CONTENT));
+        row.addView(base);
+        row.addView(remove);
+        rows.add(fields);
+        baseLabels.add(base);
+        box.addView(row);
+    }
+
+    /** A drop-down with the ingredient's base unit first, then its other units. */
+    static Spinner unitSpinner(Context c, Db.Ingredient ing) {
+        List<String> names = new ArrayList<>();
+        names.add(ing.unit);
+        for (Db.Unit u : ing.units) names.add(u.name);
+        Spinner spinner = new Spinner(c);
+        spinner.setAdapter(new ArrayAdapter<>(c, android.R.layout.simple_spinner_dropdown_item, names));
+        return spinner;
+    }
+
     /** Bought more of an ingredient: adds stock and logs the expense. */
     static void purchase(Context c, Db.Ingredient ing, Runnable done) {
         LinearLayout form = U.column(c);
         EditText qty = U.input(c, true);
         EditText paid = U.input(c, true);
-        U.field(form, "How much did you buy? (" + ing.unit + ")", qty);
+        Spinner unit = unitSpinner(c, ing);
+        if (ing.units.isEmpty()) {
+            U.field(form, "How much did you buy? (" + ing.unit + ")", qty);
+        } else {
+            LinearLayout row = U.row(c);
+            row.addView(qty, U.weight());
+            row.addView(unit);
+            U.field(form, "How much did you buy?", row);
+        }
         U.field(form, "Total paid (" + U.currency(c) + ")", paid);
         form.addView(U.muted(c, "\nThis adds to your stock, updates the ingredient's price and"
                 + " records the amount under Expenses."));
@@ -82,7 +173,8 @@ final class Dialogs {
             double p = U.parse(paid.getText());
             if (!(q > 0)) return fail(qty, "Enter an amount above 0");
             if (!(p >= 0)) return fail(paid, "Enter what you paid");
-            Db.get(c).recordPurchase(ing, q, p, U.today());
+            int picked = unit.getSelectedItemPosition();
+            Db.get(c).recordPurchase(ing, q, picked > 0 ? ing.units.get(picked - 1) : null, p, U.today());
             toast(c, "Stock and expenses updated");
             done.run();
             return true;

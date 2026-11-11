@@ -31,14 +31,16 @@ public class ScreensTest {
 
     @Before
     public void setUp() {
-        U.setCurrency(RuntimeEnvironment.getApplication(), "$");
         db = Db.get(RuntimeEnvironment.getApplication());
         salad = DbTest.seed(db);
         String today = U.today();
         Db.Order sold = DbTest.order(db, salad, 3, today);
         db.completeOrder(sold.id, today);
         open = DbTest.order(db, salad, 2, today);
-        db.recordPurchase(db.ingredients().get(1), 400, 1.6, today);
+        Db.Ingredient corn = db.ingredients().get(1);
+        corn.units.add(new Db.Unit("can", 250));
+        db.saveIngredient(corn);
+        db.recordPurchase(corn, 400, null, 1.6, today);
     }
 
     @After
@@ -52,6 +54,18 @@ public class ScreensTest {
             ViewGroup g = (ViewGroup) root;
             for (int i = 0; i < g.getChildCount(); i++) {
                 View v = find(g.getChildAt(i), text);
+                if (v != null) return v;
+            }
+        }
+        return null;
+    }
+
+    private static View findType(View root, Class<?> type) {
+        if (type.isInstance(root)) return root;
+        if (root instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) root;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                View v = findType(g.getChildAt(i), type);
                 if (v != null) return v;
             }
         }
@@ -82,6 +96,7 @@ public class ScreensTest {
 
         a.show(3);
         see(a, "$2.50 per 500 g");
+        see(a, "$1.60 per 400 g · 1 can = 250 g");
 
         a.show(4);
         see(a, "Total spent: $1.60");
@@ -111,10 +126,57 @@ public class ScreensTest {
                 new Intent().putExtra("id", salad.id)).setup().get();
         see(a, "Ingredient cost per serving: $2.55");
         see(a, "68% margin");
+        // Corn has a second unit, so its line offers a choice of unit; switching it changes the cost.
+        android.widget.Spinner unit = (android.widget.Spinner) findType(a.getWindow().getDecorView(),
+                android.widget.Spinner.class);
+        assertNotNull(unit);
+        assertEquals("g", unit.getSelectedItem());
+        unit.setSelection(1);
+        see(a, "Ingredient cost per serving: $52.35");      // 50 cans of corn instead of 50 g
+        unit.setSelection(0);
+        see(a, "Ingredient cost per serving: $2.55");
         see(a, "Save recipe").performClick();
         assertTrue(a.isFinishing());
         assertEquals(4, db.recipeLines(salad.id).size());
         assertEquals(2.55, db.recipe(salad.id).cost, 1e-9);
+    }
+
+    @Test
+    public void ingredientFormAddsACustomUnit() {
+        MainActivity a = Robolectric.buildActivity(MainActivity.class).setup().get();
+        Db.Ingredient corn = db.ingredients().get(1);
+        Dialogs.ingredient(a, corn, () -> { });
+        ShadowLooper.idleMainLooper();
+        android.app.AlertDialog dialog = (android.app.AlertDialog) ShadowDialog.getLatestDialog();
+        View form = dialog.getWindow().getDecorView();
+        assertNotNull(find(form, "can"));                      // the existing unit is listed
+        find(form, "Add a unit").performClick();
+        java.util.List<android.widget.EditText> inputs = new java.util.ArrayList<>();
+        collect(form, inputs);
+        // name, unit, pack size, price, stock, then two fields per unit row
+        assertEquals(9, inputs.size());
+        inputs.get(7).setText("scoop");
+        dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE).performClick();
+        assertTrue("stays open until the amount is filled in", dialog.isShowing());
+        inputs.get(8).setText("20");
+        dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE).performClick();
+        ShadowLooper.idleMainLooper();
+        assertTrue(!dialog.isShowing());
+
+        java.util.List<Db.Unit> units = db.ingredients().get(1).units;
+        assertEquals(2, units.size());
+        assertEquals("can", units.get(0).name);
+        assertEquals(250, units.get(0).factor, 1e-9);
+        assertEquals("scoop", units.get(1).name);
+        assertEquals(20, units.get(1).factor, 1e-9);
+    }
+
+    private static void collect(View root, java.util.List<android.widget.EditText> out) {
+        if (root instanceof android.widget.EditText) out.add((android.widget.EditText) root);
+        if (root instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) root;
+            for (int i = 0; i < g.getChildCount(); i++) collect(g.getChildAt(i), out);
+        }
     }
 
     @Test

@@ -5,11 +5,14 @@ import android.app.AlertDialog;
 import android.os.Bundle;
 import android.view.Gravity;
 import android.view.MenuItem;
+import android.view.View;
 import android.view.ViewGroup;
+import android.widget.AdapterView;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -89,6 +92,7 @@ public class RecipeActivity extends Activity {
         if (lines.isEmpty()) {
             linesBox.addView(U.muted(this, "Nothing yet. Add what goes into one serving."));
         }
+        List<Db.Ingredient> ingredients = db.ingredients();
         for (Db.Line line : lines) {
             LinearLayout row = U.row(this);
             row.addView(U.text(this, line.name, 16, false), U.weight());
@@ -102,10 +106,34 @@ public class RecipeActivity extends Activity {
                 updateSummary();
             });
             row.addView(qty, new LinearLayout.LayoutParams(U.dp(this, 84), ViewGroup.LayoutParams.WRAP_CONTENT));
-            TextView unit = U.muted(this, line.unit);
-            unit.setMinWidth(U.dp(this, 36));
-            unit.setPadding(U.dp(this, 4), 0, 0, 0);
-            row.addView(unit);
+            Db.Ingredient ing = null;
+            for (Db.Ingredient i : ingredients) if (i.id == line.ingredientId) ing = i;
+            if (ing == null || ing.units.isEmpty()) {
+                TextView unit = U.muted(this, line.unit);
+                unit.setMinWidth(U.dp(this, 36));
+                unit.setPadding(U.dp(this, 4), 0, 0, 0);
+                row.addView(unit);
+            } else {
+                // This ingredient has other units (e.g. can): let the recipe use any of them.
+                List<Db.Unit> units = ing.units;
+                Spinner unit = Dialogs.unitSpinner(this, ing);
+                for (int i = 0; i < units.size(); i++) {
+                    if (units.get(i).name.equals(line.useUnit)) unit.setSelection(i + 1);
+                }
+                unit.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+                    @Override
+                    public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                        line.useUnit = position == 0 ? null : units.get(position - 1).name;
+                        line.factor = position == 0 ? 1 : units.get(position - 1).factor;
+                        updateSummary();
+                    }
+
+                    @Override
+                    public void onNothingSelected(AdapterView<?> parent) {
+                    }
+                });
+                row.addView(unit);
+            }
             Button remove = new Button(this, null, android.R.attr.borderlessButtonStyle);
             remove.setText("✕");
             remove.setContentDescription("Remove " + line.name);
@@ -123,7 +151,7 @@ public class RecipeActivity extends Activity {
 
     private void updateSummary() {
         double cost = 0;
-        for (Db.Line l : lines) cost += l.qty * l.unitCost;
+        for (Db.Line l : lines) cost += l.cost();
         double sell = U.parse(price.getText());
         String s = "Ingredient cost per serving: " + U.money(this, cost);
         if (sell > 0) {
